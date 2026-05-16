@@ -1,0 +1,10 @@
+bin/
+obj/
+publish-latest/
+*.user
+*.suo
+*.rsuser
+.vs/
+TestResults/
+*.nupkg
+*.zip
