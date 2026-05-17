@@ -3,7 +3,9 @@ using CanBusSimulator.Models;
 namespace CanBusSimulator.Simulation;
 
 /// <summary>
-/// Generates realistic BMS values for a 20S pack and supports manual overrides.
+/// Generates realistic BMS values for a 20S pack with optional manual overrides.
+/// Models pack current, SOC integration, cell voltages, temperatures, balancing
+/// activity, and cycle accumulation in a way an ESP master would see them.
 /// </summary>
 public sealed class BmsDataSimulator : IBmsSnapshotSource
 {
@@ -21,6 +23,8 @@ public sealed class BmsDataSimulator : IBmsSnapshotSource
     private ushort _activeBalanceCells;
     private OperatingScenario _scenario;
     private ManualBmsInput _manualInput;
+    private int _cycleCount;
+    private double _accumulatedChargeAh;
 
     /// <summary>
     /// Creates a simulator with values seeded from configuration.
@@ -29,11 +33,11 @@ public sealed class BmsDataSimulator : IBmsSnapshotSource
     {
         _settings = settings;
         _scenario = settings.InitialScenario;
-        _packVoltageVolts = Clamp(settings.DefaultPackVoltageVolts, 70.0, 84.0);
-        _packCurrentAmps = Clamp(settings.DefaultCurrentAmps, -50.0, 50.0);
+        _packVoltageVolts = Clamp(settings.DefaultPackVoltageVolts, 60.0, 84.0);
+        _packCurrentAmps = Clamp(settings.DefaultCurrentAmps, -150.0, 150.0);
         _socPercent = Clamp(settings.DefaultSocPercent, 0, 100);
-        _maxTemperatureC = Clamp(settings.DefaultMaxTemperatureC, 25, 65);
-        _minTemperatureC = Clamp(settings.DefaultMinTemperatureC, 25, 65);
+        _maxTemperatureC = Clamp(settings.DefaultMaxTemperatureC, 0, 80);
+        _minTemperatureC = Clamp(settings.DefaultMinTemperatureC, 0, 80);
         _manualInput = new ManualBmsInput(
             _packVoltageVolts,
             _packCurrentAmps,
@@ -55,9 +59,7 @@ public sealed class BmsDataSimulator : IBmsSnapshotSource
         }
     }
 
-    /// <summary>
-    /// Switches between automatic simulation and user-provided values.
-    /// </summary>
+    /// <summary>Switches between automatic simulation and user-provided values.</summary>
     public void SetAutoMode(bool enabled)
     {
         lock (_syncRoot)
@@ -66,9 +68,7 @@ public sealed class BmsDataSimulator : IBmsSnapshotSource
         }
     }
 
-    /// <summary>
-    /// Sets the scenario used by automatic simulation and the status bytes.
-    /// </summary>
+    /// <summary>Sets the scenario used by automatic simulation and the status bytes.</summary>
     public void SetScenario(OperatingScenario scenario)
     {
         lock (_syncRoot)
@@ -77,9 +77,7 @@ public sealed class BmsDataSimulator : IBmsSnapshotSource
         }
     }
 
-    /// <summary>
-    /// Stores the manual values that will be emitted when auto mode is disabled.
-    /// </summary>
+    /// <summary>Stores the manual values that will be emitted when auto mode is disabled.</summary>
     public void SetManualInput(ManualBmsInput manualInput)
     {
         lock (_syncRoot)
@@ -88,9 +86,7 @@ public sealed class BmsDataSimulator : IBmsSnapshotSource
         }
     }
 
-    /// <summary>
-    /// Advances the simulation and returns the latest BMS snapshot.
-    /// </summary>
+    /// <summary>Advances the simulation and returns the latest BMS snapshot.</summary>
     public BmsSnapshot Update(TimeSpan elapsed)
     {
         lock (_syncRoot)
@@ -116,22 +112,30 @@ public sealed class BmsDataSimulator : IBmsSnapshotSource
             _ => (_random.NextDouble() - 0.5) * 1.2
         };
 
-        _packCurrentAmps = Smooth(_packCurrentAmps, Clamp(targetCurrent, -50.0, 50.0), seconds, 1.4);
+        _packCurrentAmps = Smooth(_packCurrentAmps, Clamp(targetCurrent, -150.0, 150.0), seconds, 1.4);
 
         var capacityAh = Math.Max(1.0, _settings.NominalCapacityAh);
         var deltaSoc = _packCurrentAmps * seconds / 3600.0 / capacityAh * 100.0;
         _socPercent = Clamp(_socPercent + deltaSoc, 0.0, 100.0);
 
-        var openCircuitVoltage = 70.0 + (_socPercent / 100.0 * 14.0);
-        var currentSag = _packCurrentAmps < 0
-            ? -Math.Min(1.2, Math.Abs(_packCurrentAmps) * 0.018)
-            : Math.Min(0.7, _packCurrentAmps * 0.012);
-        _packVoltageVolts = Smooth(_packVoltageVolts, Clamp(openCircuitVoltage + currentSag, 70.0, 84.0), seconds, 0.8);
+        // accumulate charge-throughput to estimate cycle count
+        _accumulatedChargeAh += Math.Abs(_packCurrentAmps) * seconds / 3600.0;
+        if (_accumulatedChargeAh >= capacityAh * 2.0)
+        {
+            _accumulatedChargeAh -= capacityAh * 2.0;
+            _cycleCount++;
+        }
 
-        var heatFromCurrent = Math.Abs(_packCurrentAmps) * 0.55;
-        var targetMaxTemp = Clamp(28.0 + heatFromCurrent + (_scenario == OperatingScenario.Charging ? 2.0 : 0.0), 25.0, 65.0);
+        var openCircuitVoltage = 60.0 + (_socPercent / 100.0 * 24.0);
+        var currentSag = _packCurrentAmps < 0
+            ? -Math.Min(2.5, Math.Abs(_packCurrentAmps) * 0.02)
+            : Math.Min(1.5, _packCurrentAmps * 0.018);
+        _packVoltageVolts = Smooth(_packVoltageVolts, Clamp(openCircuitVoltage + currentSag, 60.0, 84.0), seconds, 0.8);
+
+        var heatFromCurrent = Math.Abs(_packCurrentAmps) * 0.45;
+        var targetMaxTemp = Clamp(28.0 + heatFromCurrent + (_scenario == OperatingScenario.Charging ? 2.0 : 0.0), 20.0, 70.0);
         _maxTemperatureC = Smooth(_maxTemperatureC, targetMaxTemp + ((_random.NextDouble() - 0.5) * 0.4), seconds, 0.7);
-        _minTemperatureC = Smooth(_minTemperatureC, Clamp(_maxTemperatureC - 5.0 - (_random.NextDouble() * 4.0), 25.0, _maxTemperatureC), seconds, 0.7);
+        _minTemperatureC = Smooth(_minTemperatureC, Clamp(_maxTemperatureC - 5.0 - (_random.NextDouble() * 4.0), 20.0, _maxTemperatureC), seconds, 0.7);
 
         _activeBalanceCells = BuildBalanceMask();
     }
@@ -145,14 +149,15 @@ public sealed class BmsDataSimulator : IBmsSnapshotSource
             Math.Round(_packVoltageVolts, 3),
             Math.Round(_packCurrentAmps, 3),
             (byte)Math.Round(Clamp(_socPercent, 0.0, 100.0)),
-            (byte)Math.Round(Clamp(_maxTemperatureC, 25.0, 65.0)),
-            (byte)Math.Round(Clamp(_minTemperatureC, 25.0, 65.0)),
+            (byte)Math.Round(Clamp(_maxTemperatureC, 0.0, 80.0)),
+            (byte)Math.Round(Clamp(_minTemperatureC, 0.0, 80.0)),
             _activeBalanceCells,
             _scenario,
             cells,
             temps,
             balanceFlags,
-            DateTimeOffset.Now);
+            DateTimeOffset.Now,
+            _cycleCount);
     }
 
     private BmsSnapshot CreateManualSnapshotLocked()
@@ -161,17 +166,18 @@ public sealed class BmsDataSimulator : IBmsSnapshotSource
         var cells = Enumerable.Repeat(cellVoltage, 20).ToArray();
         var temps = BuildManualTemperatures(_manualInput.MinTemperatureC, _manualInput.MaxTemperatureC);
         return new BmsSnapshot(
-            Clamp(_manualInput.PackVoltageVolts, 70.0, 84.0),
-            Clamp(_manualInput.PackCurrentAmps, -50.0, 50.0),
+            Clamp(_manualInput.PackVoltageVolts, 60.0, 84.0),
+            Clamp(_manualInput.PackCurrentAmps, -150.0, 150.0),
             (byte)Clamp(_manualInput.SocPercent, 0, 100),
-            (byte)Clamp(_manualInput.MaxTemperatureC, 25, 65),
-            (byte)Clamp(_manualInput.MinTemperatureC, 25, 65),
+            (byte)Clamp(_manualInput.MaxTemperatureC, 0, 80),
+            (byte)Clamp(_manualInput.MinTemperatureC, 0, 80),
             _manualInput.ActiveBalanceCells,
             _manualInput.Scenario,
             cells,
             temps,
             BuildBalanceFlags(_manualInput.ActiveBalanceCells),
-            DateTimeOffset.Now);
+            DateTimeOffset.Now,
+            _cycleCount);
     }
 
     private double[] BuildCellVoltages(double averageCellVoltage)

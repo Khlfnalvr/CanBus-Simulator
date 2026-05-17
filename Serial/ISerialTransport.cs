@@ -36,6 +36,11 @@ public interface ISerialTransport : IDisposable
     Task WriteLineAsync(string line, CancellationToken cancellationToken);
 
     /// <summary>
+    /// Writes raw bytes to the COM port (used by binary frame formats).
+    /// </summary>
+    Task WriteBytesAsync(byte[] bytes, CancellationToken cancellationToken);
+
+    /// <summary>
     /// Closes the COM port if it is open.
     /// </summary>
     void Close();

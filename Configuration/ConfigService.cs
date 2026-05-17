@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace CanBusSimulator.Configuration;
 
@@ -10,30 +11,25 @@ public sealed class ConfigService
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
-        PropertyNameCaseInsensitive = true
+        PropertyNameCaseInsensitive = true,
+        Converters = { new JsonStringEnumConverter() }
     };
 
     private readonly string _configPath;
 
-    /// <summary>
-    /// Creates a configuration service using the executable directory.
-    /// </summary>
+    /// <summary>Creates a configuration service using the executable directory.</summary>
     public ConfigService()
         : this(Path.Combine(AppContext.BaseDirectory, "appsettings.json"))
     {
     }
 
-    /// <summary>
-    /// Creates a configuration service using a specific JSON file path.
-    /// </summary>
+    /// <summary>Creates a configuration service using a specific JSON file path.</summary>
     public ConfigService(string configPath)
     {
         _configPath = configPath;
     }
 
-    /// <summary>
-    /// Reads configuration from disk and falls back to safe defaults when missing or invalid.
-    /// </summary>
+    /// <summary>Reads configuration from disk and falls back to safe defaults when missing or invalid.</summary>
     public AppConfig Load()
     {
         try
@@ -52,9 +48,7 @@ public sealed class ConfigService
         }
     }
 
-    /// <summary>
-    /// Saves the latest runtime configuration. Errors are returned as text for UI logging.
-    /// </summary>
+    /// <summary>Saves the latest runtime configuration. Errors are returned as text for UI logging.</summary>
     public string? Save(AppConfig config)
     {
         try

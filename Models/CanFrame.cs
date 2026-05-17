@@ -83,11 +83,39 @@ public sealed class CanFrame
     }
 
     /// <summary>
-    /// Formats the frame using the requested human-readable protocol line.
+    /// Renders the frame using the requested wire format. Text formats include the trailing terminator.
     /// </summary>
-    public string ToWireString(bool includeChecksum)
+    public byte[] Render(WireFormat format, bool includeChecksum)
     {
-        var builder = new StringBuilder();
+        return format switch
+        {
+            WireFormat.Custom => Encoding.ASCII.GetBytes(ToCustomString(includeChecksum)),
+            WireFormat.Slcan => Encoding.ASCII.GetBytes(ToSlcanString()),
+            WireFormat.Binary => ToBinaryFrame(includeChecksum),
+            _ => throw new ArgumentOutOfRangeException(nameof(format), format, "Unknown wire format.")
+        };
+    }
+
+    /// <summary>
+    /// Returns the human-readable representation for a UI log line.
+    /// </summary>
+    public string ToDisplayString(WireFormat format, bool includeChecksum)
+    {
+        return format switch
+        {
+            WireFormat.Custom => ToCustomString(includeChecksum).TrimEnd('\r', '\n'),
+            WireFormat.Slcan => ToSlcanString().TrimEnd('\r'),
+            WireFormat.Binary => "BIN " + Convert.ToHexString(ToBinaryFrame(includeChecksum)),
+            _ => string.Empty
+        };
+    }
+
+    /// <summary>
+    /// Original custom wire format: <c>$ID:0xNNN,DLC:N,DATA:HEX[,CHK:HH]\r\n</c>.
+    /// </summary>
+    public string ToCustomString(bool includeChecksum)
+    {
+        var builder = new StringBuilder(48);
         builder.Append("$ID:0x");
         builder.Append(Identifier.ToString("X3"));
         builder.Append(",DLC:");
@@ -106,10 +134,34 @@ public sealed class CanFrame
     }
 
     /// <summary>
-    /// Formats the frame for UI display without CRLF.
+    /// SLCAN/Lawicel standard frame format: <c>tIIIDDD...\r</c>.
+    /// Used by ESP32, candleLight and most USB-CAN bridges.
     /// </summary>
-    public string ToDisplayString(bool includeChecksum)
+    public string ToSlcanString()
     {
-        return ToWireString(includeChecksum).TrimEnd('\r', '\n');
+        var builder = new StringBuilder(20);
+        builder.Append('t');
+        builder.Append(Identifier.ToString("X3"));
+        builder.Append(Dlc.ToString("X1"));
+        builder.Append(Convert.ToHexString(Payload));
+        builder.Append('\r');
+        return builder.ToString();
+    }
+
+    /// <summary>
+    /// Raw binary frame. With checksum a trailing XOR byte is appended.
+    /// </summary>
+    public byte[] ToBinaryFrame(bool includeChecksum)
+    {
+        var raw = ToRawBinary();
+        if (!includeChecksum)
+        {
+            return raw;
+        }
+
+        var withChecksum = new byte[raw.Length + 1];
+        raw.CopyTo(withChecksum, 0);
+        withChecksum[^1] = CalculateChecksum();
+        return withChecksum;
     }
 }

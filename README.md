@@ -1,134 +1,94 @@
 # CAN Bus BMS Simulator
 
-Aplikasi Windows C# (.NET 8 WinForms) untuk mensimulasikan komunikasi CAN bus BMS melalui virtual COM port. Simulator menulis frame dalam format text human-readable ke COM5, lalu BMS Monitor dapat membaca dari pasangan virtualnya, misalnya COM6.
+Aplikasi Windows untuk mensimulasikan ESP32 yang bertindak sebagai master Battery Management System. Aplikasi membaca data BMS (generated atau dari file replay) dan mendorongnya ke COM port dalam format yang sama seperti firmware ESP32 + CAN transceiver akan kirim ke host. Software BMS Monitor di sisi pasangan virtual COM port membaca data ini seperti membaca real device.
 
-Simulator bisa berjalan dalam dua mode:
+- Target: **.NET 10**, **WinUI 3** (Windows App SDK), single-file self-contained `.exe`.
+- Serial layer pakai `System.IO.Ports`.
+- MVVM pakai `CommunityToolkit.Mvvm`.
 
-- Generated/manual data dari UI.
-- Replay data dari file `.csv`, `.tsv`, `.xlsx`, atau `.xlsm`.
-- Dummy replay bawaan dari `BMS_Simulation_20S4P.csv` tanpa perlu upload file lagi.
+## Format Wire (Dipilih di UI)
 
-## Format Output
+| Format | Output                                              | Cocok untuk |
+| ------ | --------------------------------------------------- | ----------- |
+| Custom | `$ID:0x100,DLC:8,DATA:0FA0FFEC4B000000\r\n`         | BMS Monitor versi awal Anda |
+| SLCAN  | `t10080FA0FFEC4B000000\r`                           | De-facto USB-CAN bridge (ESP32 + MCP2515, candleLight, Lawicel) |
+| Binary | Raw bytes `[ID_HI][ID_LO][DLC][DATA...]`            | Reader yang parse byte stream langsung |
 
-Default line yang dikirim ke serial:
+Optional XOR checksum bisa di-append:
+- Custom: tambah token `,CHK:HH`
+- Binary: trailing byte XOR
+- SLCAN: terminator only, checksum diabaikan
 
-```text
-$ID:0x100,DLC:8,DATA:0FA0FFEC4B000000\r\n
-```
+## CAN Frame yang Disimulasikan
 
-Struktur raw yang direpresentasikan:
+Mengikuti perilaku ESP master yang membaca CAN bus 20S BMS pack. Tiap group punya cadence sendiri:
 
-```text
-[CAN_ID:2 byte big-endian] [DLC:1 byte] [PAYLOAD:0-8 byte]
-```
+| CAN ID    | Group        | Default period | Konten |
+| --------- | ------------ | -------------- | ------ |
+| 0x100     | Pack status  | 100 ms         | status, SOC 0.1%, current 0.1A signed, pack V 0.01V |
+| 0x101-105 | Cells 1-20   | 200 ms         | 20 cell voltages, 4 cell/frame, mV |
+| 0x110-112 | Temps 1-10   | 500 ms         | 10 sensors, 0.1 C signed |
+| 0x120     | Balancing    | 1000 ms        | 20-bit mask |
+| 0x130     | Diagnostic   | 500 ms         | protection/warning bits, balance count, dV mV, cycle count |
+| 0x140     | Heartbeat    | 250 ms         | signature `BMSM`, counter, uptime seconds |
 
-Checksum XOR dihitung untuk setiap frame dan tampil di log. Secara default checksum tidak dikirim ke COM port agar wire format tetap persis seperti requirement. Jika monitor membutuhkan field checksum, aktifkan `Append CHK to wire format` di UI atau `AppendChecksumToWireFormat` di `appsettings.json`.
+Semua period dapat disesuaikan di UI.
 
-## Message
+## Setup com0com (Disarankan)
 
-Satu cycle lengkap dikirim setiap 1000 ms. Dalam satu cycle aplikasi mengirim seluruh frame yang diperlukan BMS Monitor: pack, 20 cell, 10 temperature, dan balancing.
-
-Payload multi-byte ditulis big-endian.
-
-Catatan skala default disesuaikan dengan contoh payload:
-
-- Pack voltage menggunakan `20 mV/bit`, sehingga 80 V menjadi raw `4000` atau `0x0FA0`.
-- Pack current menggunakan `1 A/bit`, sehingga -20 A menjadi raw `0xFFEC`.
-- Cell voltage tetap millivolt langsung, misalnya 4.106 V menjadi `0x100A`.
-
-Skala tersebut bisa diubah pada `appsettings.json` jika BMS Monitor memakai konvensi berbeda.
-
-## Setup com0com
-
-1. Install com0com untuk Windows.
-2. Buat virtual pair, misalnya `COM15 <-> COM16`. Hindari COM yang sudah dipakai Bluetooth/USB UART.
-3. Jalankan simulator dan pilih salah satu sisi pair, misalnya `COM15`.
-4. Jalankan BMS Monitor dan arahkan pembacaan ke sisi pasangannya, misalnya `COM16`.
+1. Install `com0com` untuk Windows.
+2. Buat virtual COM pair, misal `COM15 <-> COM16`.
+3. Jalankan simulator, pilih `COM15`, klik Connect lalu Start TX.
+4. Jalankan BMS Monitor Anda dengan pembacaan diarahkan ke `COM16`.
 5. Baud rate default: `115200`.
 
-Penting: Windows serial port bersifat eksklusif. Dua aplikasi tidak boleh membuka COM yang sama. Simulator membuka sisi TX, aplikasi pembaca membuka sisi pair yang berbeda.
+Catatan: dua aplikasi tidak bisa buka COM port yang sama. Simulator buka satu sisi pair, BMS Monitor buka sisi lainnya.
 
 ## Cara Build
 
-Pastikan .NET 8 Desktop Runtime atau SDK tersedia di Windows.
+Membutuhkan .NET 10 SDK + Windows App SDK runtime (1.6+).
 
 ```powershell
-dotnet build -c Release
+dotnet build -c Release -p:Platform=x64
 ```
 
-Executable hasil build:
+## Cara Publish Single-File .exe
+
+```powershell
+dotnet publish -c Release -p:Platform=x64 -r win-x64 `
+  -p:PublishSingleFile=true `
+  -p:SelfContained=true `
+  -p:WindowsAppSDKSelfContained=true `
+  -p:IncludeNativeLibrariesForSelfExtract=true `
+  -p:EnableCompressionInSingleFile=true `
+  -p:WindowsPackageType=None
+```
+
+Output:
 
 ```text
-bin\Release\net8.0-windows\CanBusSimulator.exe
+bin\x64\Release\net10.0-windows10.0.19041.0\win-x64\publish\CanBusSimulator.exe
 ```
 
-Untuk membuat executable self-contained Windows x64:
+Cukup distribusikan satu file `.exe`. App jalan tanpa install di Windows 10 (1809+) dan Windows 11. Tidak perlu Windows App SDK runtime terpisah (bundled).
 
-```powershell
-dotnet publish -c Release -r win-x64 --self-contained true
-```
+## File Replay (CSV / XLSX)
 
-Output publish:
+Klik `Browse...` di section `Simulation File Replay`. Kolom yang dikenali:
 
-```text
-bin\Release\net8.0-windows\win-x64\publish\CanBusSimulator.exe
-```
-
-## Cara Run
-
-```powershell
-dotnet run -c Release
-```
-
-Atau buka langsung `CanBusSimulator.exe` dari folder build/publish.
-
-## Fitur UI
-
-- Pilih COM port dan baud rate.
-- Connect/Disconnect serial port.
-- Start/Stop transmission.
-- Pilih file simulasi CSV/Excel dan replay baris data ke CAN frame.
-- Auto simulation atau manual mode.
-- Pilih scenario: `Discharging`, `Charging`, `Idle`.
-- Runtime adjustment untuk voltage, current, SOC, temperature, cell voltage, balance mask.
-- Konfigurasi interval message `0x100`, `0x101`, `0x102`.
-- Log last 20 transmitted messages dengan timestamp, payload hex, checksum, dan decoded values.
-
-## File Simulasi
-
-Klik `Browse...` di bagian `Simulation File Replay`, pilih file CSV atau Excel, lalu aktifkan `Use file data`.
-
-Kolom yang dikenali otomatis:
-
-- `Timestamp`
-- `PackVoltage_V`
-- `SOC_pct`
-- `Current_A`
-- `Status` dengan nilai seperti `charging`, `discharging`, atau `idle`
+- `Timestamp`, `PackVoltage_V`, `SOC_pct`, `Current_A`, `Status`
 - `Cell1_V` sampai `Cell20_V`
 - `Bal1` sampai `Bal20`
-- `Temp1_C` sampai `Temp32_C`
+- `Temp1_C` sampai `Temp10_C`
+- `MaxTemp_C`, `MinTemp_C` (opsional)
 
-Frame yang dikirim mengikuti mapping BMS Monitor:
+## Struktur Folder
 
-- `0x100`: status, SOC 0.1%, current 0.1A signed, pack voltage 0.01V.
-- `0x101-0x105`: cell voltage `Cell1_V` sampai `Cell20_V` dalam mV.
-- `0x110-0x112`: `Temp1_C` sampai `Temp10_C` dalam 0.1 C.
-- `0x120`: balancing flags `Bal1` sampai `Bal20`.
-
-Format Excel yang didukung langsung adalah `.xlsx` dan `.xlsm`. Untuk file `.xls` lama, simpan ulang sebagai `.xlsx` atau `.csv`.
-
-## Error Handling
-
-- Koneksi serial memakai Win32 API langsung dan menampilkan pesan error yang jelas.
-- Saat write gagal atau port terputus, transport ditutup dan scheduler mencoba reconnect setiap 1 detik.
-- UI update dari background thread dilakukan melalui `BeginInvoke`.
-
-## File Penting
-
-- `Models/CanFrame.cs`: validasi CAN ID, DLC, payload, raw binary, checksum, wire format.
-- `Can/BmsCanFrameFactory.cs`: mapping BMS snapshot ke payload CAN.
-- `Simulation/BmsDataSimulator.cs`: auto/manual data simulator.
-- `Serial/Win32SerialTransport.cs`: serial COM writer tanpa NuGet dependency.
-- `Transmission/TransmissionService.cs`: queue dan periodic transmission.
-- `UI/MainForm.cs`: WinForms UI.
+- `Models/` — `CanFrame`, `BmsSnapshot`, `WireFormat`
+- `Can/BmsCanFrameFactory.cs` — mapping BMS snapshot → CAN frames (0x100/0x101–0x105/0x110–0x112/0x120/0x130/0x140)
+- `Simulation/` — auto/manual simulator + file replay
+- `Serial/SerialPortTransport.cs` — System.IO.Ports wrapper
+- `Transmission/TransmissionService.cs` — scheduler per-group cadence
+- `ViewModels/MainViewModel.cs` — state + commands (CommunityToolkit.Mvvm)
+- `Views/MainWindow.xaml` — WinUI 3 UI
+- `App.xaml(.cs)` — entry point, DI wiring

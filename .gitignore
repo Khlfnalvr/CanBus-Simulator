@@ -1,10 +1,13 @@
 bin/
 obj/
 publish-latest/
+release/
 *.user
 *.suo
 *.rsuser
 .vs/
+.claude/
 TestResults/
 *.nupkg
 *.zip
+*.pdb

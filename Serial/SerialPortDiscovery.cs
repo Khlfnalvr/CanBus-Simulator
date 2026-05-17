@@ -1,3 +1,4 @@
+using System.IO.Ports;
 using Microsoft.Win32;
 
 namespace CanBusSimulator.Serial;
@@ -24,7 +25,7 @@ public sealed record SerialPortInfo(string PortName, string DeviceName)
 }
 
 /// <summary>
-/// Enumerates Windows COM ports from the system registry.
+/// Enumerates Windows COM ports, combining SerialPort.GetPortNames with registry device names.
 /// </summary>
 public static class SerialPortDiscovery
 {
@@ -33,7 +34,11 @@ public static class SerialPortDiscovery
     /// </summary>
     public static IReadOnlyList<string> GetAvailablePorts()
     {
-        return GetAvailablePortInfos().Select(port => port.PortName).ToArray();
+        return SerialPort.GetPortNames()
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(GetNumericPortIndex)
+            .ThenBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
     }
 
     /// <summary>
@@ -41,20 +46,41 @@ public static class SerialPortDiscovery
     /// </summary>
     public static IReadOnlyList<SerialPortInfo> GetAvailablePortInfos()
     {
-        using var key = Registry.LocalMachine.OpenSubKey(@"HARDWARE\DEVICEMAP\SERIALCOMM");
-        if (key is null)
-        {
-            return Array.Empty<SerialPortInfo>();
-        }
-
-        return key.GetValueNames()
-            .Select(name => new SerialPortInfo(key.GetValue(name)?.ToString() ?? string.Empty, name))
-            .Where(port => !string.IsNullOrWhiteSpace(port.PortName))
-            .GroupBy(port => port.PortName, StringComparer.OrdinalIgnoreCase)
-            .Select(group => group.First())
+        var deviceMap = BuildDeviceNameMap();
+        return SerialPort.GetPortNames()
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(port => new SerialPortInfo(port, deviceMap.TryGetValue(port, out var device) ? device : string.Empty))
             .OrderBy(port => GetNumericPortIndex(port.PortName))
             .ThenBy(port => port.PortName, StringComparer.OrdinalIgnoreCase)
             .ToArray();
+    }
+
+    private static Dictionary<string, string> BuildDeviceNameMap()
+    {
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey(@"HARDWARE\DEVICEMAP\SERIALCOMM");
+            if (key is null)
+            {
+                return map;
+            }
+
+            foreach (var name in key.GetValueNames())
+            {
+                var portName = key.GetValue(name)?.ToString();
+                if (!string.IsNullOrWhiteSpace(portName))
+                {
+                    map[portName] = name;
+                }
+            }
+        }
+        catch
+        {
+            // registry access can fail in sandboxed environments; ports still listed by SerialPort
+        }
+
+        return map;
     }
 
     private static int GetNumericPortIndex(string portName)

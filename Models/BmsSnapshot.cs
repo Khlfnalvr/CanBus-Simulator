@@ -16,4 +16,5 @@ public sealed record BmsSnapshot(
     double[] CellVoltagesVolts,
     double[] TemperaturesC,
     bool[] BalanceFlags,
-    DateTimeOffset Timestamp);
+    DateTimeOffset Timestamp,
+    int CycleCount = 0);

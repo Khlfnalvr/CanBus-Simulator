@@ -6,11 +6,12 @@ namespace CanBusSimulator.Can;
 
 /// <summary>
 /// Converts BMS snapshots into the CAN frame set consumed by BMS Monitor.
+/// Layout matches what an ESP32 master typically forwards from the BMS bus.
 /// </summary>
 public static class BmsCanFrameFactory
 {
     /// <summary>
-    /// Creates message 0x100: pack voltage, pack current, SOC, and status flags.
+    /// Message 0x100: pack voltage, pack current, SOC, and status flags.
     /// </summary>
     public static CanFrame CreatePackStatus(BmsSnapshot snapshot, SimulationSettings settings)
     {
@@ -30,7 +31,7 @@ public static class BmsCanFrameFactory
     }
 
     /// <summary>
-    /// Creates one cell-voltage frame. IDs 0x101-0x105 carry cells 1-20, four cells per frame.
+    /// One cell-voltage frame. IDs 0x101-0x105 carry cells 1-20, four cells per frame.
     /// </summary>
     public static CanFrame CreateCellVoltageGroup(BmsSnapshot snapshot, int group)
     {
@@ -51,7 +52,7 @@ public static class BmsCanFrameFactory
     }
 
     /// <summary>
-    /// Creates one temperature frame. IDs 0x110-0x112 carry ten sensors in 0.1 C units.
+    /// One temperature frame. IDs 0x110-0x112 carry ten sensors in 0.1 C units.
     /// </summary>
     public static CanFrame CreateTemperatureGroup(BmsSnapshot snapshot, int group)
     {
@@ -73,7 +74,7 @@ public static class BmsCanFrameFactory
     }
 
     /// <summary>
-    /// Creates message 0x120: 20 balancing flags in little-endian bit order.
+    /// Message 0x120: 20 balancing flags in little-endian bit order.
     /// </summary>
     public static CanFrame CreateBalancing(BmsSnapshot snapshot)
     {
@@ -94,25 +95,75 @@ public static class BmsCanFrameFactory
     }
 
     /// <summary>
-    /// Creates a full BMS Monitor update cycle from one snapshot.
+    /// Message 0x130: diagnostic / fault byte map.
+    /// byte0=protection bits, byte1=warning bits, byte2=balancing-active count,
+    /// byte3=delta cell mV high, byte4=delta cell mV low,
+    /// byte5=cycle count high, byte6=cycle count low, byte7=reserved.
     /// </summary>
-    public static IReadOnlyList<CanFrame> CreateFullCycle(BmsSnapshot snapshot, SimulationSettings settings)
+    public static CanFrame CreateDiagnostic(BmsSnapshot snapshot)
     {
-        var frames = new List<CanFrame>(10);
+        Span<byte> payload = stackalloc byte[8];
 
-        for (var group = 0; group < 5; group++)
+        byte protection = 0;
+        byte warning = 0;
+        if (snapshot.MaxTemperatureC >= 60) protection |= 0x01;
+        else if (snapshot.MaxTemperatureC >= 55) warning |= 0x01;
+        if (snapshot.MinTemperatureC <= 5) protection |= 0x02;
+        else if (snapshot.MinTemperatureC <= 10) warning |= 0x02;
+        if (snapshot.PackVoltageVolts >= 84.0) protection |= 0x04;
+        else if (snapshot.PackVoltageVolts >= 83.0) warning |= 0x04;
+        if (snapshot.PackVoltageVolts <= 60.0) protection |= 0x08;
+        else if (snapshot.PackVoltageVolts <= 62.0) warning |= 0x08;
+        if (Math.Abs(snapshot.PackCurrentAmps) >= 100.0) protection |= 0x10;
+        else if (Math.Abs(snapshot.PackCurrentAmps) >= 80.0) warning |= 0x10;
+
+        payload[0] = protection;
+        payload[1] = warning;
+
+        var balanceCount = 0;
+        foreach (var active in snapshot.BalanceFlags)
         {
-            frames.Add(CreateCellVoltageGroup(snapshot, group));
+            if (active) balanceCount++;
         }
 
-        for (var group = 0; group < 3; group++)
+        payload[2] = (byte)Math.Min(255, balanceCount);
+
+        var deltaMv = 0;
+        if (snapshot.CellVoltagesVolts.Length > 0)
         {
-            frames.Add(CreateTemperatureGroup(snapshot, group));
+            var max = snapshot.CellVoltagesVolts.Max();
+            var min = snapshot.CellVoltagesVolts.Min();
+            deltaMv = (int)Math.Round((max - min) * 1000.0);
         }
 
-        frames.Add(CreateBalancing(snapshot));
-        frames.Add(CreatePackStatus(snapshot, settings));
-        return frames;
+        WriteUInt16BigEndian(payload, 3, ClampToUInt16(deltaMv));
+
+        var cycleCount = snapshot.CycleCount;
+        WriteUInt16BigEndian(payload, 5, ClampToUInt16(cycleCount));
+        payload[7] = 0;
+
+        return new CanFrame(0x130, 8, payload);
+    }
+
+    /// <summary>
+    /// Message 0x140: heartbeat. Carries firmware id, counter, and uptime seconds.
+    /// </summary>
+    public static CanFrame CreateHeartbeat(BmsSnapshot snapshot, byte counter)
+    {
+        Span<byte> payload = stackalloc byte[8];
+        // 'B','M','S','M' = BMS Master signature so monitor can detect the ESP source
+        payload[0] = (byte)'B';
+        payload[1] = (byte)'M';
+        payload[2] = (byte)'S';
+        payload[3] = (byte)'M';
+        payload[4] = counter;
+
+        var uptimeSeconds = (uint)(DateTimeOffset.UtcNow.ToUnixTimeSeconds() & 0xFFFFFF);
+        payload[5] = (byte)((uptimeSeconds >> 16) & 0xFF);
+        payload[6] = (byte)((uptimeSeconds >> 8) & 0xFF);
+        payload[7] = (byte)(uptimeSeconds & 0xFF);
+
+        return new CanFrame(0x140, 8, payload);
     }
 
     /// <summary>
@@ -126,6 +177,8 @@ public static class BmsCanFrameFactory
             >= 0x101 and <= 0x105 when frame.Payload.Length == 8 => DescribeCells(frame),
             >= 0x110 and <= 0x112 => DescribeTemperature(frame),
             0x120 => DescribeBalancing(frame.Payload),
+            0x130 when frame.Payload.Length == 8 => DescribeDiagnostic(frame.Payload),
+            0x140 when frame.Payload.Length == 8 => DescribeHeartbeat(frame.Payload),
             _ => "Unknown frame"
         };
     }
@@ -178,6 +231,24 @@ public static class BmsCanFrameFactory
         return $"BalanceBits=0x{bits:X5}";
     }
 
+    private static string DescribeDiagnostic(byte[] payload)
+    {
+        var protection = payload[0];
+        var warning = payload[1];
+        var balCount = payload[2];
+        var delta = ReadUInt16BigEndian(payload, 3);
+        var cycles = ReadUInt16BigEndian(payload, 5);
+        return $"Prot=0x{protection:X2}, Warn=0x{warning:X2}, BalActive={balCount}, dV={delta}mV, Cycles={cycles}";
+    }
+
+    private static string DescribeHeartbeat(byte[] payload)
+    {
+        var sig = System.Text.Encoding.ASCII.GetString(payload, 0, 4);
+        var counter = payload[4];
+        var uptime = ((uint)payload[5] << 16) | ((uint)payload[6] << 8) | payload[7];
+        return $"Sig={sig}, Cnt={counter}, Up={uptime}s";
+    }
+
     private static void WriteUInt16BigEndian(Span<byte> payload, int offset, ushort value)
     {
         payload[offset] = (byte)(value >> 8);
@@ -203,6 +274,11 @@ public static class BmsCanFrameFactory
     private static ushort ClampToUInt16(double value)
     {
         return (ushort)Math.Clamp((int)Math.Round(value), ushort.MinValue, ushort.MaxValue);
+    }
+
+    private static ushort ClampToUInt16(int value)
+    {
+        return (ushort)Math.Clamp(value, ushort.MinValue, ushort.MaxValue);
     }
 
     private static short ClampToInt16(double value)
