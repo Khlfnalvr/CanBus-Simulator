@@ -52,16 +52,12 @@ Membutuhkan .NET 10 SDK + Windows App SDK runtime (1.6+).
 dotnet build -c Release -p:Platform=x64
 ```
 
-## Cara Publish Single-File .exe
+## Cara Publish Single-File .exe (Ukuran Minimum)
+
+Properti optimisasi sudah tertanam di `CanBusSimulator.csproj` (trim, compress, framework feature switches). Cukup jalankan:
 
 ```powershell
-dotnet publish -c Release -p:Platform=x64 -r win-x64 `
-  -p:PublishSingleFile=true `
-  -p:SelfContained=true `
-  -p:WindowsAppSDKSelfContained=true `
-  -p:IncludeNativeLibrariesForSelfExtract=true `
-  -p:EnableCompressionInSingleFile=true `
-  -p:WindowsPackageType=None
+dotnet publish -c Release -p:Platform=x64 -r win-x64
 ```
 
 Output:
@@ -71,6 +67,54 @@ bin\x64\Release\net10.0-windows10.0.19041.0\win-x64\publish\CanBusSimulator.exe
 ```
 
 Cukup distribusikan satu file `.exe`. App jalan tanpa install di Windows 10 (1809+) dan Windows 11. Tidak perlu Windows App SDK runtime terpisah (bundled).
+
+### Detail Optimisasi Publish
+
+Project sudah mengaktifkan secara default (di Release):
+
+- `PublishSingleFile=true` — semua dependency dibundel menjadi satu `.exe`.
+- `EnableCompressionInSingleFile=true` — single-file payload dikompresi.
+- `IncludeNativeLibrariesForSelfExtract=true` — native lib ikut dibundel.
+- `PublishTrimmed=true` + `TrimMode=partial` — IL yang tidak terpakai dibuang. Mode `partial` aman untuk WinUI 3 (full trim bisa break XAML reflection).
+- `PublishReadyToRun=false` — prefer ukuran kecil di atas startup time (R2R akan menambah ~30-50% size).
+- `IlcOptimizationPreference=Size` — preference ukuran terkecil untuk codegen.
+- `DebugType=none`, `DebugSymbols=false` — tidak ada PDB di output Release.
+- Framework feature switches off:
+  - `EventSourceSupport`
+  - `HttpActivityPropagationSupport`
+  - `MetadataUpdaterSupport`
+  - `DebuggerSupport`
+  - `EnableUnsafeBinaryFormatterSerialization`
+  - `EnableUnsafeUTF7Encoding`
+  - `UseNativeHttpHandler`
+  - `NullabilityInfoContextSupport`
+  - `XmlResolverIsNetworkingEnabledByDefault`
+  - `UseSystemResourceKeys=true` (resource keys diganti dengan key string pendek)
+
+Untuk maximum-tiny build (eksperimen), tambah:
+
+```powershell
+dotnet publish -c Release -p:Platform=x64 -r win-x64 -p:TrimMode=full
+```
+
+Hati-hati: `TrimMode=full` boleh saja break WinUI XAML reflection di skenario tertentu — uji jalannya UI dulu.
+
+## Optimisasi Runtime
+
+Hot path transmission sudah dihardenkan untuk reduce GC pressure:
+
+- **`CanFrame.TryRender(Span<byte>, ...)`** — render frame langsung ke caller buffer; nol byte[] alokasi di hot path.
+- **`TransmissionService`** — single `byte[64]` worker buffer dipakai ulang untuk setiap frame. Tidak ada `ConcurrentQueue` antara producer dan consumer (worker single-threaded). Settings dibaca via atomic reference swap (volatile record), tidak ada lock per-iterasi.
+- **`PeriodicTimer`** menggantikan `Task.Delay(10)` polling loop untuk timing tick yang lebih akurat.
+- **`BmsCanFrameFactory`** — tidak ada LINQ di hot path. Min/max + counting via plain loop.
+- **String describe** menggunakan `string.Create(CultureInfo, ...)` interpolation handler — minimal intermediate string allocation.
+
+## Fitur Baru di UI
+
+- **Stats counter** di log section: total frame terkirim, total byte, jumlah error, uptime TX.
+- **Clear log** button untuk reset isi log tanpa restart TX.
+- **Export log** button untuk save snapshot 100 frame terakhir ke file teks.
+- **Reset stats** button untuk reset semua counter ke nol.
 
 ## File Replay (CSV / XLSX)
 

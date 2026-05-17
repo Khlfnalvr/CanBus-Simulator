@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Text;
 
 namespace CanBusSimulator.Models;
@@ -7,9 +8,9 @@ namespace CanBusSimulator.Models;
 /// </summary>
 public sealed class CanFrame
 {
-    /// <summary>
-    /// Creates a frame and validates CAN identifier, DLC, and payload length.
-    /// </summary>
+    private static ReadOnlySpan<byte> HexAscii =>
+        "0123456789ABCDEF"u8;
+
     public CanFrame(ushort identifier, byte dlc, ReadOnlySpan<byte> payload)
     {
         if (identifier > 0x7FF)
@@ -32,136 +33,155 @@ public sealed class CanFrame
         Payload = payload.ToArray();
     }
 
-    /// <summary>
-    /// 11-bit CAN identifier.
-    /// </summary>
     public ushort Identifier { get; }
 
-    /// <summary>
-    /// Data Length Code, from 0 to 8.
-    /// </summary>
     public byte Dlc { get; }
 
-    /// <summary>
-    /// Payload bytes. The length always equals DLC.
-    /// </summary>
     public byte[] Payload { get; }
 
-    /// <summary>
-    /// Builds a CAN frame from an identifier and payload.
-    /// </summary>
-    public static CanFrame FromPayload(ushort identifier, params byte[] payload)
+    public static CanFrame FromPayload(ushort identifier, ReadOnlySpan<byte> payload)
     {
         return new CanFrame(identifier, (byte)payload.Length, payload);
     }
 
     /// <summary>
-    /// Returns the raw binary representation: CAN_ID big-endian, DLC, and payload bytes.
-    /// </summary>
-    public byte[] ToRawBinary()
-    {
-        var raw = new byte[3 + Payload.Length];
-        raw[0] = (byte)(Identifier >> 8);
-        raw[1] = (byte)(Identifier & 0xFF);
-        raw[2] = Dlc;
-        Payload.CopyTo(raw.AsSpan(3));
-        return raw;
-    }
-
-    /// <summary>
-    /// Calculates an 8-bit XOR checksum over the raw binary frame bytes.
+    /// XOR checksum over [ID_HI][ID_LO][DLC][payload].
     /// </summary>
     public byte CalculateChecksum()
     {
-        byte checksum = 0;
-        foreach (var value in ToRawBinary())
+        byte c = (byte)((Identifier >> 8) ^ (Identifier & 0xFF) ^ Dlc);
+        var data = Payload;
+        for (var i = 0; i < data.Length; i++)
         {
-            checksum ^= value;
+            c ^= data[i];
         }
-
-        return checksum;
+        return c;
     }
 
     /// <summary>
-    /// Renders the frame using the requested wire format. Text formats include the trailing terminator.
+    /// Renders into <paramref name="destination"/>. Returns the number of bytes written.
+    /// Caller must size destination at least 64 bytes to fit any format.
     /// </summary>
-    public byte[] Render(WireFormat format, bool includeChecksum)
+    public int TryRender(Span<byte> destination, WireFormat format, bool includeChecksum)
     {
         return format switch
         {
-            WireFormat.Custom => Encoding.ASCII.GetBytes(ToCustomString(includeChecksum)),
-            WireFormat.Slcan => Encoding.ASCII.GetBytes(ToSlcanString()),
-            WireFormat.Binary => ToBinaryFrame(includeChecksum),
+            WireFormat.Custom => WriteCustom(destination, includeChecksum),
+            WireFormat.Slcan => WriteSlcan(destination),
+            WireFormat.Binary => WriteBinary(destination, includeChecksum),
             _ => throw new ArgumentOutOfRangeException(nameof(format), format, "Unknown wire format.")
         };
     }
 
-    /// <summary>
-    /// Returns the human-readable representation for a UI log line.
-    /// </summary>
+    /// <summary>Returns rendered bytes. Convenience overload that allocates.</summary>
+    public byte[] Render(WireFormat format, bool includeChecksum)
+    {
+        Span<byte> buffer = stackalloc byte[64];
+        var written = TryRender(buffer, format, includeChecksum);
+        return buffer[..written].ToArray();
+    }
+
+    /// <summary>Human-readable line for the UI log.</summary>
     public string ToDisplayString(WireFormat format, bool includeChecksum)
     {
+        Span<byte> buffer = stackalloc byte[64];
+        var written = TryRender(buffer, format, includeChecksum);
+        var slice = buffer[..written];
+
         return format switch
         {
-            WireFormat.Custom => ToCustomString(includeChecksum).TrimEnd('\r', '\n'),
-            WireFormat.Slcan => ToSlcanString().TrimEnd('\r'),
-            WireFormat.Binary => "BIN " + Convert.ToHexString(ToBinaryFrame(includeChecksum)),
+            WireFormat.Custom => Encoding.ASCII.GetString(TrimTrailing(slice, (byte)'\r', (byte)'\n')),
+            WireFormat.Slcan => Encoding.ASCII.GetString(TrimTrailing(slice, (byte)'\r')),
+            WireFormat.Binary => "BIN " + Convert.ToHexString(slice),
             _ => string.Empty
         };
     }
 
-    /// <summary>
-    /// Original custom wire format: <c>$ID:0xNNN,DLC:N,DATA:HEX[,CHK:HH]\r\n</c>.
-    /// </summary>
-    public string ToCustomString(bool includeChecksum)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ReadOnlySpan<byte> TrimTrailing(ReadOnlySpan<byte> s, byte a)
     {
-        var builder = new StringBuilder(48);
-        builder.Append("$ID:0x");
-        builder.Append(Identifier.ToString("X3"));
-        builder.Append(",DLC:");
-        builder.Append(Dlc);
-        builder.Append(",DATA:");
-        builder.Append(Convert.ToHexString(Payload));
+        while (s.Length > 0 && s[^1] == a) s = s[..^1];
+        return s;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ReadOnlySpan<byte> TrimTrailing(ReadOnlySpan<byte> s, byte a, byte b)
+    {
+        while (s.Length > 0 && (s[^1] == a || s[^1] == b)) s = s[..^1];
+        return s;
+    }
+
+    private int WriteCustom(Span<byte> dst, bool includeChecksum)
+    {
+        // "$ID:0xNNN,DLC:N,DATA:HEX[,CHK:HH]\r\n"
+        var pos = 0;
+        WriteAscii(dst, ref pos, "$ID:0x"u8);
+        WriteHex(dst, ref pos, (byte)(Identifier >> 8), upperByte: true);
+        WriteHex(dst, ref pos, (byte)(Identifier & 0xFF), upperByte: false);
+        WriteAscii(dst, ref pos, ",DLC:"u8);
+        dst[pos++] = (byte)('0' + Dlc);
+        WriteAscii(dst, ref pos, ",DATA:"u8);
+        var payload = Payload;
+        for (var i = 0; i < payload.Length; i++) WriteHex(dst, ref pos, payload[i]);
 
         if (includeChecksum)
         {
-            builder.Append(",CHK:");
-            builder.Append(CalculateChecksum().ToString("X2"));
+            WriteAscii(dst, ref pos, ",CHK:"u8);
+            WriteHex(dst, ref pos, CalculateChecksum());
         }
 
-        builder.Append("\r\n");
-        return builder.ToString();
+        dst[pos++] = (byte)'\r';
+        dst[pos++] = (byte)'\n';
+        return pos;
     }
 
-    /// <summary>
-    /// SLCAN/Lawicel standard frame format: <c>tIIIDDD...\r</c>.
-    /// Used by ESP32, candleLight and most USB-CAN bridges.
-    /// </summary>
-    public string ToSlcanString()
+    private int WriteSlcan(Span<byte> dst)
     {
-        var builder = new StringBuilder(20);
-        builder.Append('t');
-        builder.Append(Identifier.ToString("X3"));
-        builder.Append(Dlc.ToString("X1"));
-        builder.Append(Convert.ToHexString(Payload));
-        builder.Append('\r');
-        return builder.ToString();
+        // "tIIIDHEX\r" — checksum ignored for SLCAN.
+        var pos = 0;
+        dst[pos++] = (byte)'t';
+        WriteHex(dst, ref pos, (byte)(Identifier >> 8), upperByte: true);
+        WriteHex(dst, ref pos, (byte)(Identifier & 0xFF), upperByte: false);
+        dst[pos++] = HexAscii[Dlc & 0x0F];
+        var payload = Payload;
+        for (var i = 0; i < payload.Length; i++) WriteHex(dst, ref pos, payload[i]);
+        dst[pos++] = (byte)'\r';
+        return pos;
     }
 
-    /// <summary>
-    /// Raw binary frame. With checksum a trailing XOR byte is appended.
-    /// </summary>
-    public byte[] ToBinaryFrame(bool includeChecksum)
+    private int WriteBinary(Span<byte> dst, bool includeChecksum)
     {
-        var raw = ToRawBinary();
-        if (!includeChecksum)
+        dst[0] = (byte)(Identifier >> 8);
+        dst[1] = (byte)(Identifier & 0xFF);
+        dst[2] = Dlc;
+        Payload.CopyTo(dst[3..]);
+        var len = 3 + Payload.Length;
+        if (includeChecksum)
         {
-            return raw;
+            dst[len++] = CalculateChecksum();
         }
+        return len;
+    }
 
-        var withChecksum = new byte[raw.Length + 1];
-        raw.CopyTo(withChecksum, 0);
-        withChecksum[^1] = CalculateChecksum();
-        return withChecksum;
+    // 3-nibble ID: writes high byte as one nibble ("X3" → first hex char), low byte as two.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void WriteHex(Span<byte> dst, ref int pos, byte value, bool upperByte = false)
+    {
+        if (upperByte)
+        {
+            dst[pos++] = HexAscii[value & 0x0F]; // single nibble for the top of the 11-bit id
+        }
+        else
+        {
+            dst[pos++] = HexAscii[(value >> 4) & 0x0F];
+            dst[pos++] = HexAscii[value & 0x0F];
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void WriteAscii(Span<byte> dst, ref int pos, ReadOnlySpan<byte> literal)
+    {
+        literal.CopyTo(dst[pos..]);
+        pos += literal.Length;
     }
 }

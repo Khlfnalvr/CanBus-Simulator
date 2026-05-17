@@ -12,16 +12,12 @@ public sealed class SerialPortTransport : ISerialTransport
     private readonly SemaphoreSlim _gate = new(1, 1);
     private SerialPort? _port;
 
-    /// <inheritdoc />
     public event EventHandler<string>? StatusChanged;
 
-    /// <inheritdoc />
     public bool IsOpen => _port is { IsOpen: true };
 
-    /// <inheritdoc />
     public SerialOptions? CurrentOptions { get; private set; }
 
-    /// <inheritdoc />
     public async Task OpenAsync(SerialOptions options, CancellationToken cancellationToken)
     {
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -38,14 +34,10 @@ public sealed class SerialPortTransport : ISerialTransport
         }
     }
 
-    /// <inheritdoc />
     public async Task<bool> TryReconnectAsync(CancellationToken cancellationToken)
     {
         var options = CurrentOptions;
-        if (options is null)
-        {
-            return false;
-        }
+        if (options is null) return false;
 
         try
         {
@@ -59,15 +51,7 @@ public sealed class SerialPortTransport : ISerialTransport
         }
     }
 
-    /// <inheritdoc />
-    public async Task WriteLineAsync(string line, CancellationToken cancellationToken)
-    {
-        var bytes = Encoding.ASCII.GetBytes(line);
-        await WriteBytesAsync(bytes, cancellationToken).ConfigureAwait(false);
-    }
-
-    /// <inheritdoc />
-    public async Task WriteBytesAsync(byte[] bytes, CancellationToken cancellationToken)
+    public async Task WriteBytesAsync(ReadOnlyMemory<byte> bytes, CancellationToken cancellationToken)
     {
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -77,8 +61,7 @@ public sealed class SerialPortTransport : ISerialTransport
                 throw new InvalidOperationException("Serial port is not open.");
             }
 
-            await _port.BaseStream.WriteAsync(bytes.AsMemory(), cancellationToken).ConfigureAwait(false);
-            await _port.BaseStream.FlushAsync(cancellationToken).ConfigureAwait(false);
+            await _port.BaseStream.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -86,7 +69,6 @@ public sealed class SerialPortTransport : ISerialTransport
         }
     }
 
-    /// <inheritdoc />
     public void Close()
     {
         _gate.Wait();
@@ -100,7 +82,6 @@ public sealed class SerialPortTransport : ISerialTransport
         }
     }
 
-    /// <inheritdoc />
     public void Dispose()
     {
         Close();
@@ -130,10 +111,7 @@ public sealed class SerialPortTransport : ISerialTransport
 
     private void CloseNoLock()
     {
-        if (_port is null)
-        {
-            return;
-        }
+        if (_port is null) return;
 
         try
         {
