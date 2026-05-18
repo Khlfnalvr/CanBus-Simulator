@@ -1,4 +1,6 @@
 using System.Collections.ObjectModel;
+using System.Globalization;
+using System.Text;
 using CanBusSimulator.Configuration;
 using CanBusSimulator.Models;
 using CanBusSimulator.Serial;
@@ -27,7 +29,6 @@ public sealed partial class MainViewModel : ObservableObject
     private readonly BmsSnapshotProvider _snapshotProvider;
     private readonly TransmissionService _transmissionService;
     private readonly DispatcherQueue _dispatcher;
-    private SerialPortInfo? _selectedPortInfo;
 
     [ObservableProperty]
     private ObservableCollection<SerialPortInfo> _availablePorts = new();
@@ -125,18 +126,18 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty]
     private string _fileInfoText = "No simulation file loaded.";
 
+    [ObservableProperty]
+    private string _statsText = "Frames: 0  •  Bytes: 0  •  Errors: 0  •  Uptime: 00:00:00";
+
     /// <summary>Observable transmission log shown in the UI.</summary>
     public ObservableCollection<LogEntry> Log { get; } = new();
 
-    /// <summary>List of scenarios for binding to a ComboBox.</summary>
     public IReadOnlyList<OperatingScenario> Scenarios { get; } =
         new[] { OperatingScenario.Idle, OperatingScenario.Charging, OperatingScenario.Discharging };
 
-    /// <summary>List of wire formats for binding to a ComboBox.</summary>
     public IReadOnlyList<WireFormat> WireFormats { get; } =
         new[] { WireFormat.Custom, WireFormat.Slcan, WireFormat.Binary };
 
-    /// <summary>Creates the ViewModel with already-wired services and config.</summary>
     public MainViewModel(
         ConfigService configService,
         AppConfig config,
@@ -162,7 +163,6 @@ public sealed partial class MainViewModel : ObservableObject
         ApplyIntervals();
     }
 
-    /// <summary>Refreshes the available COM ports list.</summary>
     [RelayCommand]
     public void RefreshPorts()
     {
@@ -184,7 +184,6 @@ public sealed partial class MainViewModel : ObservableObject
         }
     }
 
-    /// <summary>Opens or closes the serial port.</summary>
     [RelayCommand]
     public async Task ToggleConnectionAsync()
     {
@@ -215,7 +214,6 @@ public sealed partial class MainViewModel : ObservableObject
 
         try
         {
-            _selectedPortInfo = SelectedPort;
             _config.Serial.PortName = portName;
             _config.Serial.BaudRate = baudRate;
             await _transport.OpenAsync(new SerialOptions(portName, baudRate), CancellationToken.None);
@@ -228,7 +226,6 @@ public sealed partial class MainViewModel : ObservableObject
         }
     }
 
-    /// <summary>Starts or stops periodic transmission.</summary>
     [RelayCommand]
     public async Task ToggleTransmissionAsync()
     {
@@ -244,10 +241,7 @@ public sealed partial class MainViewModel : ObservableObject
         if (!_transport.IsOpen)
         {
             await ToggleConnectionAsync();
-            if (!_transport.IsOpen)
-            {
-                return;
-            }
+            if (!_transport.IsOpen) return;
         }
 
         if (UseFileData && !_fileDataSource.HasRows)
@@ -268,7 +262,41 @@ public sealed partial class MainViewModel : ObservableObject
             : "Transmission running from generated data.";
     }
 
-    /// <summary>Loads a simulation file from disk and refreshes file replay state.</summary>
+    [RelayCommand]
+    public void ClearLog()
+    {
+        Log.Clear();
+        StatusMessage = "Log cleared.";
+    }
+
+    [RelayCommand]
+    public void ResetStats()
+    {
+        _transmissionService.ResetStatistics();
+        UpdateStatsDisplay();
+        StatusMessage = "Statistics reset.";
+    }
+
+    /// <summary>
+    /// Returns a snapshot of the current log entries serialized as a text export.
+    /// </summary>
+    public string BuildLogExportText()
+    {
+        // Snapshot — Log is updated only on the UI thread.
+        var entries = Log.ToArray();
+        var sb = new StringBuilder(entries.Length * 96);
+        sb.AppendLine("Time         | Wire Line                                   | CHK  | Decoded");
+        sb.AppendLine("-------------+---------------------------------------------+------+-----------------------------");
+        foreach (var e in entries)
+        {
+            sb.Append(e.Time.PadRight(12)).Append(" | ")
+              .Append(e.WireLine.Length > 43 ? e.WireLine[..43] : e.WireLine.PadRight(43)).Append(" | ")
+              .Append(e.Checksum.PadRight(4)).Append(" | ")
+              .AppendLine(e.Decoded);
+        }
+        return sb.ToString();
+    }
+
     public async Task LoadSimulationFileAsync(string filePath)
     {
         try
@@ -291,7 +319,6 @@ public sealed partial class MainViewModel : ObservableObject
         }
     }
 
-    /// <summary>Saves all current UI values back into the AppConfig and persists it.</summary>
     public void SaveConfig()
     {
         _config.Serial.PortName = SelectedPort?.PortName ?? _config.Serial.PortName;
@@ -326,7 +353,6 @@ public sealed partial class MainViewModel : ObservableObject
         }
     }
 
-    /// <summary>Stops the worker and closes the serial port. Used on window close.</summary>
     public async Task ShutdownAsync()
     {
         await _transmissionService.StopAsync();
@@ -334,7 +360,6 @@ public sealed partial class MainViewModel : ObservableObject
         _transmissionService.Dispose();
     }
 
-    /// <summary>Resolves the persisted theme preference. <c>Default</c> means follow system.</summary>
     public ElementTheme ResolveStartupTheme()
     {
         return _config.Theme switch
@@ -345,7 +370,6 @@ public sealed partial class MainViewModel : ObservableObject
         };
     }
 
-    /// <summary>Persists the chosen theme to the config (saved on window close).</summary>
     public void SetTheme(ElementTheme theme)
     {
         _config.Theme = theme switch
@@ -406,7 +430,7 @@ public sealed partial class MainViewModel : ObservableObject
 
     private void LoadFromConfig()
     {
-        BaudRateText = _config.Serial.BaudRate.ToString();
+        BaudRateText = _config.Serial.BaudRate.ToString(CultureInfo.InvariantCulture);
         AppendChecksum = _config.Serial.AppendChecksumToWireFormat;
         SelectedWireFormat = _config.Serial.WireFormat;
         SelectedScenario = _config.Simulation.InitialScenario;
@@ -440,7 +464,12 @@ public sealed partial class MainViewModel : ObservableObject
         });
         _transmissionService.FrameTransmitted += (_, args) => DispatchUi(() => AddLog(args));
         _transmissionService.Error += (_, message) => DispatchUi(() => StatusMessage = $"Error: {message}");
-        _transmissionService.RateUpdated += (_, args) => DispatchUi(() => RateText = $"TX rate: {args.FramesPerSecond:0} fps");
+        _transmissionService.RateUpdated += (_, args) => DispatchUi(() =>
+        {
+            RateText = $"TX rate: {args.FramesPerSecond:0} fps";
+            UpdateStatsDisplay();
+            if (_fileDataSource.HasRows) UpdateFileInfo();
+        });
     }
 
     private void PushUiToSimulator()
@@ -483,31 +512,35 @@ public sealed partial class MainViewModel : ObservableObject
 
     private void UpdateFileInfo()
     {
-        if (_fileDataSource.HasRows)
-        {
-            FileInfoText = $"Loaded {_fileDataSource.RowCount} rows, replay row {_fileDataSource.CurrentRowNumber}/{_fileDataSource.RowCount}.";
-        }
-        else
-        {
-            FileInfoText = "No simulation file loaded.";
-        }
+        FileInfoText = _fileDataSource.HasRows
+            ? $"Loaded {_fileDataSource.RowCount} rows, replay row {_fileDataSource.CurrentRowNumber}/{_fileDataSource.RowCount}."
+            : "No simulation file loaded.";
+    }
+
+    private void UpdateStatsDisplay()
+    {
+        var frames = _transmissionService.TotalFrames;
+        var bytes = _transmissionService.TotalBytes;
+        var errors = _transmissionService.TotalErrors;
+        var started = _transmissionService.StartedAt;
+        var uptime = started is null ? TimeSpan.Zero : DateTimeOffset.UtcNow - started.Value;
+        StatsText = string.Create(CultureInfo.InvariantCulture,
+            $"Frames: {frames:N0}  •  Bytes: {bytes:N0}  •  Errors: {errors:N0}  •  Uptime: {uptime:hh\\:mm\\:ss}");
     }
 
     private void AddLog(FrameTransmittedEventArgs args)
     {
         var entry = new LogEntry(
-            args.Timestamp.ToString("HH:mm:ss.fff"),
+            args.Timestamp.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture),
             args.WireLine,
             $"0x{args.Checksum:X2}",
             args.DecodedText);
 
         Log.Insert(0, entry);
-        while (Log.Count > LogCapacity)
+        if (Log.Count > LogCapacity)
         {
             Log.RemoveAt(Log.Count - 1);
         }
-
-        UpdateFileInfo();
     }
 
     private void DispatchUi(Action action)

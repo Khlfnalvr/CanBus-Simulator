@@ -1,19 +1,21 @@
 using System.Globalization;
 using System.IO.Compression;
 using System.Text;
-using System.Xml.Linq;
+using System.Xml;
 using CanBusSimulator.Models;
 
 namespace CanBusSimulator.Simulation;
 
 /// <summary>
 /// Reads BMS simulation rows from CSV, TSV, XLSX, and XLSM files.
+/// XLSX path uses XmlReader streaming to avoid pulling in System.Xml.Linq.
 /// </summary>
 public static class SimulationFileReader
 {
-    /// <summary>
-    /// Loads a simulation file and maps known BMS columns into snapshots.
-    /// </summary>
+    private const string SpreadsheetNs = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    private const string RelationshipsNs = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    private const string PackageRelationshipsNs = "http://schemas.openxmlformats.org/package/2006/relationships";
+
     public static SimulationFileData Load(string filePath, SimulationSettings defaults)
     {
         if (!File.Exists(filePath))
@@ -42,9 +44,8 @@ public static class SimulationFileReader
         }
 
         var warnings = new List<string>();
-        var headers = rows[0];
-        var columnMap = BuildColumnMap(headers);
-        var snapshots = new List<BmsSnapshot>();
+        var columnMap = BuildColumnMap(rows[0]);
+        var snapshots = new List<BmsSnapshot>(rows.Count - 1);
 
         var packVoltageColumn = FindColumn(columnMap, "PackVoltage_V", "PackVoltage", "Voltage_V", "Voltage");
         var currentColumn = FindColumn(columnMap, "Current_A", "PackCurrent_A", "PackCurrent", "Current");
@@ -61,10 +62,7 @@ public static class SimulationFileReader
         for (var rowIndex = 1; rowIndex < rows.Count; rowIndex++)
         {
             var row = rows[rowIndex];
-            if (IsEmptyRow(row))
-            {
-                continue;
-            }
+            if (IsEmptyRow(row)) continue;
 
             var packVoltage = GetDouble(row, packVoltageColumn, defaults.DefaultPackVoltageVolts);
             var current = GetDouble(row, currentColumn, defaults.DefaultCurrentAmps);
@@ -74,7 +72,7 @@ public static class SimulationFileReader
             var cellVoltages = GetCellVoltages(row, columnMap, packVoltage, defaults);
             var balanceMask = GetBalanceMask(row, columnMap);
             var temperatures = GetTemperatureArray(row, columnMap, defaults);
-            var (maxTemp, minTemp) = GetTemperatures(row, columnMap, maxTempColumn, minTempColumn, defaults, temperatures);
+            var (maxTemp, minTemp) = GetTemperatures(row, maxTempColumn, minTempColumn, defaults, temperatures);
             var balanceFlags = GetBalanceFlags(row, columnMap);
 
             snapshots.Add(new BmsSnapshot(
@@ -118,12 +116,8 @@ public static class SimulationFileReader
     {
         foreach (var alias in aliases)
         {
-            if (map.TryGetValue(NormalizeHeader(alias), out var index))
-            {
-                return index;
-            }
+            if (map.TryGetValue(NormalizeHeader(alias), out var index)) return index;
         }
-
         return -1;
     }
 
@@ -131,12 +125,12 @@ public static class SimulationFileReader
     {
         var cells = new double[20];
         var fallback = Math.Clamp(packVoltage / 20.0, 3.0, 4.2);
+        var defaultCell = defaults.DefaultCellVoltageVolts > 0 ? defaults.DefaultCellVoltageVolts : fallback;
         for (var cell = 1; cell <= 20; cell++)
         {
             var column = FindColumn(map, $"Cell{cell}_V", $"Cell{cell}", $"CellVoltage{cell}_V", $"CellVoltage{cell}");
-            cells[cell - 1] = GetDouble(row, column, defaults.DefaultCellVoltageVolts > 0 ? defaults.DefaultCellVoltageVolts : fallback);
+            cells[cell - 1] = GetDouble(row, column, defaultCell);
         }
-
         return cells;
     }
 
@@ -151,7 +145,6 @@ public static class SimulationFileReader
                 mask |= (ushort)(1 << (cell - 1));
             }
         }
-
         return mask;
     }
 
@@ -163,30 +156,34 @@ public static class SimulationFileReader
             var column = FindColumn(map, $"Bal{cell}", $"Balance{cell}", $"BalanceCell{cell}");
             flags[cell - 1] = IsTruthy(GetString(row, column));
         }
-
         return flags;
     }
 
     private static (byte MaxTemp, byte MinTemp) GetTemperatures(
         string[] row,
-        IReadOnlyDictionary<string, int> map,
         int maxTempColumn,
         int minTempColumn,
         SimulationSettings defaults,
-        IReadOnlyList<double> knownTemperatures)
+        double[] knownTemperatures)
     {
         var maxTemp = GetDouble(row, maxTempColumn, double.NaN);
         var minTemp = GetDouble(row, minTempColumn, double.NaN);
-        var allTemps = knownTemperatures.Where(value => !double.IsNaN(value)).ToArray();
 
-        if (double.IsNaN(maxTemp))
+        if (double.IsNaN(maxTemp) || double.IsNaN(minTemp))
         {
-            maxTemp = allTemps.Length > 0 ? allTemps.Max() : defaults.DefaultMaxTemperatureC;
-        }
+            double max = double.MinValue, min = double.MaxValue;
+            var anyValid = false;
+            for (var i = 0; i < knownTemperatures.Length; i++)
+            {
+                var v = knownTemperatures[i];
+                if (double.IsNaN(v)) continue;
+                if (v > max) max = v;
+                if (v < min) min = v;
+                anyValid = true;
+            }
 
-        if (double.IsNaN(minTemp))
-        {
-            minTemp = allTemps.Length > 0 ? allTemps.Min() : defaults.DefaultMinTemperatureC;
+            if (double.IsNaN(maxTemp)) maxTemp = anyValid ? max : defaults.DefaultMaxTemperatureC;
+            if (double.IsNaN(minTemp)) minTemp = anyValid ? min : defaults.DefaultMinTemperatureC;
         }
 
         return (ToByte(maxTemp, 0, 255), ToByte(minTemp, 0, 255));
@@ -200,27 +197,15 @@ public static class SimulationFileReader
             var column = FindColumn(map, $"Temp{index}_C", $"Temp{index}", $"Temperature{index}_C", $"Temperature{index}");
             temps[index - 1] = GetDouble(row, column, defaults.DefaultMinTemperatureC);
         }
-
         return temps;
     }
 
     private static OperatingScenario GetScenario(string status, double current)
     {
-        var normalized = status.Trim().ToLowerInvariant();
-        if (normalized.StartsWith("dis", StringComparison.Ordinal))
-        {
-            return OperatingScenario.Discharging;
-        }
-
-        if (normalized.StartsWith("cha", StringComparison.Ordinal))
-        {
-            return OperatingScenario.Charging;
-        }
-
-        if (normalized.StartsWith("idle", StringComparison.Ordinal))
-        {
-            return OperatingScenario.Idle;
-        }
+        var normalized = status.Trim();
+        if (normalized.StartsWith("dis", StringComparison.OrdinalIgnoreCase)) return OperatingScenario.Discharging;
+        if (normalized.StartsWith("cha", StringComparison.OrdinalIgnoreCase)) return OperatingScenario.Charging;
+        if (normalized.StartsWith("idle", StringComparison.OrdinalIgnoreCase)) return OperatingScenario.Idle;
 
         return current switch
         {
@@ -244,29 +229,25 @@ public static class SimulationFileReader
 
     private static void AddWarningIfMissing(List<string> warnings, int column, string name, object defaultValue)
     {
-        if (column < 0)
+        if (column < 0) warnings.Add($"Column {name} tidak ditemukan, memakai default {defaultValue}.");
+    }
+
+    private static bool IsEmptyRow(string[] row)
+    {
+        for (var i = 0; i < row.Length; i++)
         {
-            warnings.Add($"Column {name} tidak ditemukan, memakai default {defaultValue}.");
+            if (!string.IsNullOrWhiteSpace(row[i])) return false;
         }
+        return true;
     }
 
-    private static bool IsEmptyRow(IEnumerable<string> row)
-    {
-        return row.All(string.IsNullOrWhiteSpace);
-    }
-
-    private static string GetString(string[] row, int column)
-    {
-        return column >= 0 && column < row.Length ? row[column].Trim() : string.Empty;
-    }
+    private static string GetString(string[] row, int column) =>
+        column >= 0 && column < row.Length ? row[column].Trim() : string.Empty;
 
     private static double GetDouble(string[] row, int column, double defaultValue)
     {
         var value = GetString(row, column);
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return defaultValue;
-        }
+        if (string.IsNullOrWhiteSpace(value)) return defaultValue;
 
         return double.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var parsed)
             || double.TryParse(value, NumberStyles.Any, CultureInfo.CurrentCulture, out parsed)
@@ -276,42 +257,42 @@ public static class SimulationFileReader
 
     private static byte ToByte(double value, int min, int max)
     {
-        if (double.IsNaN(value) || double.IsInfinity(value))
-        {
-            value = min;
-        }
-
+        if (double.IsNaN(value) || double.IsInfinity(value)) value = min;
         return (byte)Math.Clamp((int)Math.Round(value), min, max);
     }
 
     private static bool IsTruthy(string value)
     {
-        var normalized = value.Trim().ToLowerInvariant();
-        return normalized is "1" or "true" or "yes" or "y" or "on" or "active"
-            || (double.TryParse(normalized, NumberStyles.Any, CultureInfo.InvariantCulture, out var number) && Math.Abs(number) > 0.0001);
+        var normalized = value.Trim();
+        if (normalized.Length == 0) return false;
+        if (normalized.Equals("1", StringComparison.Ordinal)
+            || normalized.Equals("true", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("yes", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("y", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("on", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("active", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return double.TryParse(normalized, NumberStyles.Any, CultureInfo.InvariantCulture, out var n) && Math.Abs(n) > 0.0001;
     }
 
     private static string NormalizeHeader(string value)
     {
         var builder = new StringBuilder(value.Length);
-        foreach (var character in value)
+        for (var i = 0; i < value.Length; i++)
         {
-            if (char.IsLetterOrDigit(character))
-            {
-                builder.Append(char.ToLowerInvariant(character));
-            }
+            var c = value[i];
+            if (char.IsLetterOrDigit(c)) builder.Append(char.ToLowerInvariant(c));
         }
-
         return builder.ToString();
     }
 
     private static List<string[]> ReadDelimitedRows(string filePath, char delimiter)
     {
         var text = File.ReadAllText(filePath, Encoding.UTF8);
-        if (text.Length > 0 && text[0] == '\uFEFF')
-        {
-            text = text[1..];
-        }
+        if (text.Length > 0 && text[0] == '\uFEFF') text = text[1..];
 
         var rows = new List<string[]>();
         var currentRow = new List<string>();
@@ -320,10 +301,10 @@ public static class SimulationFileReader
 
         for (var index = 0; index < text.Length; index++)
         {
-            var character = text[index];
+            var c = text[index];
             if (inQuotes)
             {
-                if (character == '"')
+                if (c == '"')
                 {
                     if (index + 1 < text.Length && text[index + 1] == '"')
                     {
@@ -337,36 +318,30 @@ public static class SimulationFileReader
                 }
                 else
                 {
-                    currentField.Append(character);
+                    currentField.Append(c);
                 }
 
                 continue;
             }
 
-            if (character == '"')
-            {
-                inQuotes = true;
-            }
-            else if (character == delimiter)
+            if (c == '"') inQuotes = true;
+            else if (c == delimiter)
             {
                 currentRow.Add(currentField.ToString());
                 currentField.Clear();
             }
-            else if (character is '\r' or '\n')
+            else if (c is '\r' or '\n')
             {
                 currentRow.Add(currentField.ToString());
                 currentField.Clear();
                 rows.Add(currentRow.ToArray());
                 currentRow.Clear();
 
-                if (character == '\r' && index + 1 < text.Length && text[index + 1] == '\n')
-                {
-                    index++;
-                }
+                if (c == '\r' && index + 1 < text.Length && text[index + 1] == '\n') index++;
             }
             else
             {
-                currentField.Append(character);
+                currentField.Append(c);
             }
         }
 
@@ -379,66 +354,151 @@ public static class SimulationFileReader
         return rows;
     }
 
+    // --- XLSX streaming parser (XmlReader) ---
+
     private static List<string[]> ReadXlsxRows(string filePath)
     {
         using var archive = ZipFile.OpenRead(filePath);
         var sharedStrings = ReadSharedStrings(archive);
-        var firstSheetPath = GetFirstWorksheetPath(archive);
-        var sheetEntry = archive.GetEntry(firstSheetPath)
-            ?? throw new InvalidDataException($"Worksheet {firstSheetPath} was not found in workbook.");
+        var sheetPath = GetFirstWorksheetPath(archive);
+        var sheetEntry = archive.GetEntry(sheetPath)
+            ?? throw new InvalidDataException($"Worksheet {sheetPath} was not found in workbook.");
 
-        using var stream = sheetEntry.Open();
-        var document = XDocument.Load(stream);
-        XNamespace spreadsheet = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
         var rows = new List<string[]>();
+        using var stream = sheetEntry.Open();
+        using var reader = XmlReader.Create(stream, XmlSettings());
 
-        foreach (var rowElement in document.Descendants(spreadsheet + "row"))
+        var rowCells = new SortedDictionary<int, string>();
+        var inRow = false;
+
+        while (reader.Read())
         {
-            var cells = new SortedDictionary<int, string>();
-            foreach (var cellElement in rowElement.Elements(spreadsheet + "c"))
+            if (reader.NodeType == XmlNodeType.Element)
             {
-                var reference = cellElement.Attribute("r")?.Value ?? string.Empty;
-                var columnIndex = GetColumnIndex(reference);
-                if (columnIndex < 0)
+                switch (reader.LocalName)
                 {
-                    columnIndex = cells.Count;
+                    case "row":
+                        rowCells.Clear();
+                        inRow = true;
+                        break;
+
+                    case "c" when inRow:
+                        ReadCell(reader, sharedStrings, rowCells);
+                        break;
                 }
-
-                cells[columnIndex] = ReadCellValue(cellElement, sharedStrings, spreadsheet);
             }
-
-            if (cells.Count == 0)
+            else if (reader.NodeType == XmlNodeType.EndElement && reader.LocalName == "row")
             {
-                rows.Add(Array.Empty<string>());
-                continue;
+                if (rowCells.Count == 0)
+                {
+                    rows.Add(Array.Empty<string>());
+                }
+                else
+                {
+                    var row = new string[rowCells.Keys.Max() + 1];
+                    foreach (var kv in rowCells) row[kv.Key] = kv.Value;
+                    rows.Add(row);
+                }
+                inRow = false;
             }
-
-            var row = new string[cells.Keys.Max() + 1];
-            foreach (var cell in cells)
-            {
-                row[cell.Key] = cell.Value;
-            }
-
-            rows.Add(row);
         }
 
         return rows;
     }
 
+    private static void ReadCell(XmlReader reader, IReadOnlyList<string> sharedStrings, SortedDictionary<int, string> rowCells)
+    {
+        var reference = reader.GetAttribute("r");
+        var columnIndex = GetColumnIndex(reference ?? string.Empty);
+        if (columnIndex < 0) columnIndex = rowCells.Count;
+        var cellType = reader.GetAttribute("t");
+
+        // <c .../> self-closing → no value
+        if (reader.IsEmptyElement)
+        {
+            rowCells[columnIndex] = string.Empty;
+            return;
+        }
+
+        string value = string.Empty;
+        var depth = reader.Depth;
+
+        while (reader.Read() && !(reader.NodeType == XmlNodeType.EndElement && reader.Depth == depth))
+        {
+            if (reader.NodeType != XmlNodeType.Element) continue;
+
+            switch (reader.LocalName)
+            {
+                case "v":
+                {
+                    var raw = reader.ReadElementContentAsString();
+                    if (cellType == "s" && int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var idx))
+                    {
+                        value = (idx >= 0 && idx < sharedStrings.Count) ? sharedStrings[idx] : string.Empty;
+                    }
+                    else if (cellType == "b")
+                    {
+                        value = raw == "1" ? "true" : "false";
+                    }
+                    else
+                    {
+                        value = raw;
+                    }
+                    break;
+                }
+                case "is":
+                case "t":
+                {
+                    // inlineStr can also be <is><t>text</t></is> or rich-text variants.
+                    value = ReadAllTextNodes(reader);
+                    break;
+                }
+            }
+        }
+
+        rowCells[columnIndex] = value;
+    }
+
     private static List<string> ReadSharedStrings(ZipArchive archive)
     {
         var entry = archive.GetEntry("xl/sharedStrings.xml");
-        if (entry is null)
+        if (entry is null) return new List<string>();
+
+        var list = new List<string>();
+        using var stream = entry.Open();
+        using var reader = XmlReader.Create(stream, XmlSettings());
+
+        while (reader.Read())
         {
-            return new List<string>();
+            if (reader.NodeType == XmlNodeType.Element && reader.LocalName == "si")
+            {
+                list.Add(ReadAllTextNodes(reader));
+            }
         }
 
-        using var stream = entry.Open();
-        var document = XDocument.Load(stream);
-        XNamespace spreadsheet = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-        return document.Descendants(spreadsheet + "si")
-            .Select(item => string.Concat(item.Descendants(spreadsheet + "t").Select(text => text.Value)))
-            .ToList();
+        return list;
+    }
+
+    /// <summary>
+    /// Consumes the current element and returns concatenated <c>&lt;t&gt;</c> content.
+    /// Handles rich-text shared strings (<c>&lt;si&gt;&lt;r&gt;&lt;t&gt;...&lt;/t&gt;&lt;/r&gt;&lt;/si&gt;</c>).
+    /// </summary>
+    private static string ReadAllTextNodes(XmlReader reader)
+    {
+        if (reader.IsEmptyElement) return string.Empty;
+
+        var depth = reader.Depth;
+        var builder = new StringBuilder();
+
+        while (reader.Read() && !(reader.NodeType == XmlNodeType.EndElement && reader.Depth == depth))
+        {
+            if (reader.NodeType == XmlNodeType.Element && reader.LocalName == "t")
+            {
+                builder.Append(reader.ReadElementContentAsString());
+            }
+        }
+
+        return builder.ToString();
     }
 
     private static string GetFirstWorksheetPath(ZipArchive archive)
@@ -448,77 +508,65 @@ public static class SimulationFileReader
         var relationshipsEntry = archive.GetEntry("xl/_rels/workbook.xml.rels")
             ?? throw new InvalidDataException("Workbook relationships were not found.");
 
-        XNamespace spreadsheet = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-        XNamespace relationships = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-        XNamespace packageRelationships = "http://schemas.openxmlformats.org/package/2006/relationships";
+        string? relationshipId = null;
+        using (var ws = workbookEntry.Open())
+        using (var rd = XmlReader.Create(ws, XmlSettings()))
+        {
+            while (rd.Read())
+            {
+                if (rd.NodeType == XmlNodeType.Element && rd.LocalName == "sheet")
+                {
+                    relationshipId = rd.GetAttribute("id", RelationshipsNs);
+                    break;
+                }
+            }
+        }
 
-        using var workbookStream = workbookEntry.Open();
-        var workbookDocument = XDocument.Load(workbookStream);
-        var firstSheet = workbookDocument.Descendants(spreadsheet + "sheet").FirstOrDefault()
-            ?? throw new InvalidDataException("Workbook does not contain a worksheet.");
-        var relationshipId = firstSheet.Attribute(relationships + "id")?.Value
-            ?? throw new InvalidDataException("First worksheet relationship id was not found.");
+        if (string.IsNullOrEmpty(relationshipId))
+            throw new InvalidDataException("Workbook does not contain a worksheet.");
 
-        using var relationshipsStream = relationshipsEntry.Open();
-        var relationshipsDocument = XDocument.Load(relationshipsStream);
-        var target = relationshipsDocument.Descendants(packageRelationships + "Relationship")
-            .FirstOrDefault(element => element.Attribute("Id")?.Value == relationshipId)
-            ?.Attribute("Target")
-            ?.Value;
+        string? target = null;
+        using (var rs = relationshipsEntry.Open())
+        using (var rd = XmlReader.Create(rs, XmlSettings()))
+        {
+            while (rd.Read())
+            {
+                if (rd.NodeType == XmlNodeType.Element && rd.LocalName == "Relationship" &&
+                    rd.GetAttribute("Id") == relationshipId)
+                {
+                    target = rd.GetAttribute("Target");
+                    break;
+                }
+            }
+        }
 
         if (string.IsNullOrWhiteSpace(target))
-        {
             throw new InvalidDataException("First worksheet relationship target was not found.");
-        }
 
         target = target.Replace('\\', '/');
-        if (target.StartsWith("/xl/", StringComparison.OrdinalIgnoreCase))
-        {
-            return target.TrimStart('/');
-        }
-
-        return target.StartsWith("xl/", StringComparison.OrdinalIgnoreCase)
-            ? target
-            : $"xl/{target.TrimStart('/')}";
-    }
-
-    private static string ReadCellValue(XElement cellElement, IReadOnlyList<string> sharedStrings, XNamespace spreadsheet)
-    {
-        var type = cellElement.Attribute("t")?.Value;
-        if (type == "inlineStr")
-        {
-            return string.Concat(cellElement.Descendants(spreadsheet + "t").Select(text => text.Value));
-        }
-
-        var rawValue = cellElement.Element(spreadsheet + "v")?.Value ?? string.Empty;
-        if (type == "s" && int.TryParse(rawValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out var sharedIndex))
-        {
-            return sharedIndex >= 0 && sharedIndex < sharedStrings.Count ? sharedStrings[sharedIndex] : string.Empty;
-        }
-
-        if (type == "b")
-        {
-            return rawValue == "1" ? "true" : "false";
-        }
-
-        return rawValue;
+        if (target.StartsWith("/xl/", StringComparison.OrdinalIgnoreCase)) return target.TrimStart('/');
+        return target.StartsWith("xl/", StringComparison.OrdinalIgnoreCase) ? target : $"xl/{target.TrimStart('/')}";
     }
 
     private static int GetColumnIndex(string cellReference)
     {
         var column = 0;
         var foundLetter = false;
-        foreach (var character in cellReference)
+        foreach (var c in cellReference)
         {
-            if (!char.IsLetter(character))
-            {
-                break;
-            }
-
+            if (!char.IsLetter(c)) break;
             foundLetter = true;
-            column = (column * 26) + (char.ToUpperInvariant(character) - 'A' + 1);
+            column = (column * 26) + (char.ToUpperInvariant(c) - 'A' + 1);
         }
-
         return foundLetter ? column - 1 : -1;
     }
+
+    private static XmlReaderSettings XmlSettings() => new()
+    {
+        IgnoreWhitespace = true,
+        IgnoreComments = true,
+        IgnoreProcessingInstructions = true,
+        DtdProcessing = DtdProcessing.Prohibit,
+        XmlResolver = null
+    };
 }

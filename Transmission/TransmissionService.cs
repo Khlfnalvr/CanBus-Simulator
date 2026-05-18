@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using CanBusSimulator.Can;
 using CanBusSimulator.Models;
 using CanBusSimulator.Serial;
@@ -13,26 +12,22 @@ namespace CanBusSimulator.Transmission;
 public sealed class TransmissionService : IDisposable
 {
     private readonly object _stateGate = new();
-    private readonly object _settingsGate = new();
-    private readonly ConcurrentQueue<CanFrame> _queue = new();
     private readonly ISerialTransport _transport;
     private readonly IBmsSnapshotSource _snapshotSource;
     private readonly SimulationSettings _simulationSettings;
     private CancellationTokenSource? _cancellationTokenSource;
     private Task? _workerTask;
-    private TimeSpan _packInterval;
-    private TimeSpan _temperatureInterval;
-    private TimeSpan _cellInterval;
-    private TimeSpan _balancingInterval;
-    private TimeSpan _diagnosticInterval;
-    private TimeSpan _heartbeatInterval;
-    private bool _appendChecksumToWireFormat;
-    private WireFormat _wireFormat = WireFormat.Custom;
+
+    // Snapshot of mutable settings: written atomically on every change, read once per loop.
+    private volatile RuntimeSettings _settings;
+
+    // Stats (Interlocked-updated, snapshot read from any thread).
+    private long _totalFrames;
+    private long _totalBytes;
+    private long _totalErrors;
+    private DateTimeOffset _startedAt;
     private int _sentSinceLastRate;
 
-    /// <summary>
-    /// Creates a transmission service using the supplied transport and simulator.
-    /// </summary>
     public TransmissionService(
         ISerialTransport transport,
         IBmsSnapshotSource snapshotSource,
@@ -44,21 +39,13 @@ public sealed class TransmissionService : IDisposable
         _transport = transport;
         _snapshotSource = snapshotSource;
         _simulationSettings = simulationSettings;
-        UpdateIntervals(intervals);
-        _appendChecksumToWireFormat = appendChecksumToWireFormat;
-        _wireFormat = wireFormat;
+        _settings = RuntimeSettings.From(intervals, appendChecksumToWireFormat, wireFormat);
     }
 
-    /// <summary>Raised after each frame is written successfully.</summary>
     public event EventHandler<FrameTransmittedEventArgs>? FrameTransmitted;
-
-    /// <summary>Raised when a recoverable transmission or reconnect error occurs.</summary>
     public event EventHandler<string>? Error;
-
-    /// <summary>Raised every second with measured frames-per-second.</summary>
     public event EventHandler<TransmissionRateEventArgs>? RateUpdated;
 
-    /// <summary>True while the background worker is active.</summary>
     public bool IsRunning
     {
         get
@@ -70,22 +57,23 @@ public sealed class TransmissionService : IDisposable
         }
     }
 
-    /// <summary>Starts periodic frame generation and transmission.</summary>
+    public long TotalFrames => Interlocked.Read(ref _totalFrames);
+    public long TotalBytes => Interlocked.Read(ref _totalBytes);
+    public long TotalErrors => Interlocked.Read(ref _totalErrors);
+    public DateTimeOffset? StartedAt => _startedAt == default ? null : _startedAt;
+
     public void Start()
     {
         lock (_stateGate)
         {
-            if (_workerTask is { IsCompleted: false })
-            {
-                return;
-            }
+            if (_workerTask is { IsCompleted: false }) return;
 
             _cancellationTokenSource = new CancellationTokenSource();
+            _startedAt = DateTimeOffset.UtcNow;
             _workerTask = Task.Run(() => RunAsync(_cancellationTokenSource.Token));
         }
     }
 
-    /// <summary>Stops the background worker and waits for it to finish.</summary>
     public async Task StopAsync()
     {
         CancellationTokenSource? cts;
@@ -96,10 +84,7 @@ public sealed class TransmissionService : IDisposable
             task = _workerTask;
         }
 
-        if (cts is null || task is null)
-        {
-            return;
-        }
+        if (cts is null || task is null) return;
 
         cts.Cancel();
         try
@@ -123,46 +108,42 @@ public sealed class TransmissionService : IDisposable
         }
     }
 
-    /// <summary>Updates message periods without restarting transmission.</summary>
     public void UpdateIntervals(TransmissionIntervals intervals)
     {
-        lock (_settingsGate)
-        {
-            _packInterval = TimeSpan.FromMilliseconds(Math.Max(50, intervals.PackStatusMs));
-            _temperatureInterval = TimeSpan.FromMilliseconds(Math.Max(50, intervals.TemperatureMs));
-            _cellInterval = TimeSpan.FromMilliseconds(Math.Max(50, intervals.CellVoltageMs));
-            _balancingInterval = TimeSpan.FromMilliseconds(Math.Max(50, intervals.BalancingMs));
-            _diagnosticInterval = TimeSpan.FromMilliseconds(Math.Max(50, intervals.DiagnosticMs));
-            _heartbeatInterval = TimeSpan.FromMilliseconds(Math.Max(50, intervals.HeartbeatMs));
-        }
+        var s = _settings;
+        _settings = s.WithIntervals(intervals);
     }
 
-    /// <summary>Enables or disables appending an XOR checksum field to the wire output.</summary>
     public void SetAppendChecksumToWireFormat(bool enabled)
     {
-        lock (_settingsGate)
-        {
-            _appendChecksumToWireFormat = enabled;
-        }
+        var s = _settings;
+        _settings = s with { AppendChecksum = enabled };
     }
 
-    /// <summary>Switches between Custom text, SLCAN, and Binary wire formats at runtime.</summary>
     public void SetWireFormat(WireFormat format)
     {
-        lock (_settingsGate)
-        {
-            _wireFormat = format;
-        }
+        var s = _settings;
+        _settings = s with { Format = format };
     }
 
-    /// <inheritdoc />
+    public void ResetStatistics()
+    {
+        Interlocked.Exchange(ref _totalFrames, 0);
+        Interlocked.Exchange(ref _totalBytes, 0);
+        Interlocked.Exchange(ref _totalErrors, 0);
+        _startedAt = IsRunning ? DateTimeOffset.UtcNow : default;
+    }
+
     public void Dispose()
     {
         StopAsync().GetAwaiter().GetResult();
     }
 
-    private async Task RunAsync(CancellationToken cancellationToken)
+    private async Task RunAsync(CancellationToken ct)
     {
+        // Reused write buffer — sized to fit the largest possible wire-format encoding.
+        var writeBuffer = new byte[64];
+
         var lastUpdate = DateTimeOffset.UtcNow;
         var nextPack = lastUpdate;
         var nextTemperature = lastUpdate;
@@ -171,76 +152,66 @@ public sealed class TransmissionService : IDisposable
         var nextDiagnostic = lastUpdate;
         var nextHeartbeat = lastUpdate;
         var nextRate = lastUpdate.AddSeconds(1);
-        var nextReconnectAttempt = DateTimeOffset.MinValue;
+        var nextReconnect = DateTimeOffset.MinValue;
         byte heartbeatCounter = 0;
 
-        while (!cancellationToken.IsCancellationRequested)
+        using var periodic = new PeriodicTimer(TimeSpan.FromMilliseconds(10));
+
+        while (!ct.IsCancellationRequested)
         {
             var now = DateTimeOffset.UtcNow;
             var elapsed = now - lastUpdate;
             lastUpdate = now;
             var snapshot = _snapshotSource.Update(elapsed);
+            var s = _settings; // single volatile read per iteration
 
-            TimeSpan packInt, tempInt, cellInt, balInt, diagInt, hbInt;
-            lock (_settingsGate)
+            if (!_transport.IsOpen && now >= nextReconnect)
             {
-                packInt = _packInterval;
-                tempInt = _temperatureInterval;
-                cellInt = _cellInterval;
-                balInt = _balancingInterval;
-                diagInt = _diagnosticInterval;
-                hbInt = _heartbeatInterval;
+                await TryReconnectAsync(ct).ConfigureAwait(false);
+                nextReconnect = now.AddSeconds(1);
             }
 
             if (now >= nextPack)
             {
-                _queue.Enqueue(BmsCanFrameFactory.CreatePackStatus(snapshot, _simulationSettings));
-                nextPack = now + packInt;
+                await SendAsync(BmsCanFrameFactory.CreatePackStatus(snapshot, _simulationSettings), writeBuffer, s, ct).ConfigureAwait(false);
+                nextPack = now + s.PackInterval;
             }
 
             if (now >= nextCell)
             {
-                for (var group = 0; group < 5; group++)
+                for (var g = 0; g < 5; g++)
                 {
-                    _queue.Enqueue(BmsCanFrameFactory.CreateCellVoltageGroup(snapshot, group));
+                    await SendAsync(BmsCanFrameFactory.CreateCellVoltageGroup(snapshot, g), writeBuffer, s, ct).ConfigureAwait(false);
                 }
-                nextCell = now + cellInt;
+                nextCell = now + s.CellInterval;
             }
 
             if (now >= nextTemperature)
             {
-                for (var group = 0; group < 3; group++)
+                for (var g = 0; g < 3; g++)
                 {
-                    _queue.Enqueue(BmsCanFrameFactory.CreateTemperatureGroup(snapshot, group));
+                    await SendAsync(BmsCanFrameFactory.CreateTemperatureGroup(snapshot, g), writeBuffer, s, ct).ConfigureAwait(false);
                 }
-                nextTemperature = now + tempInt;
+                nextTemperature = now + s.TempInterval;
             }
 
             if (now >= nextBalancing)
             {
-                _queue.Enqueue(BmsCanFrameFactory.CreateBalancing(snapshot));
-                nextBalancing = now + balInt;
+                await SendAsync(BmsCanFrameFactory.CreateBalancing(snapshot), writeBuffer, s, ct).ConfigureAwait(false);
+                nextBalancing = now + s.BalancingInterval;
             }
 
             if (now >= nextDiagnostic)
             {
-                _queue.Enqueue(BmsCanFrameFactory.CreateDiagnostic(snapshot));
-                nextDiagnostic = now + diagInt;
+                await SendAsync(BmsCanFrameFactory.CreateDiagnostic(snapshot), writeBuffer, s, ct).ConfigureAwait(false);
+                nextDiagnostic = now + s.DiagnosticInterval;
             }
 
             if (now >= nextHeartbeat)
             {
-                _queue.Enqueue(BmsCanFrameFactory.CreateHeartbeat(snapshot, heartbeatCounter++));
-                nextHeartbeat = now + hbInt;
+                await SendAsync(BmsCanFrameFactory.CreateHeartbeat(snapshot, heartbeatCounter++), writeBuffer, s, ct).ConfigureAwait(false);
+                nextHeartbeat = now + s.HeartbeatInterval;
             }
-
-            if (!_transport.IsOpen && now >= nextReconnectAttempt)
-            {
-                await TryReconnectAsync(cancellationToken).ConfigureAwait(false);
-                nextReconnectAttempt = now.AddSeconds(1);
-            }
-
-            await DrainQueueAsync(cancellationToken).ConfigureAwait(false);
 
             if (now >= nextRate)
             {
@@ -249,60 +220,102 @@ public sealed class TransmissionService : IDisposable
                 nextRate = now.AddSeconds(1);
             }
 
-            await Task.Delay(10, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await periodic.WaitForNextTickAsync(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
         }
     }
 
-    private async Task TryReconnectAsync(CancellationToken cancellationToken)
+    private async Task SendAsync(CanFrame frame, byte[] buffer, RuntimeSettings s, CancellationToken ct)
     {
-        if (_transport.CurrentOptions is null)
+        if (!_transport.IsOpen) return;
+
+        int length;
+        try
         {
+            length = frame.TryRender(buffer, s.Format, s.AppendChecksum);
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Increment(ref _totalErrors);
+            Error?.Invoke(this, $"Render failed: {ex.Message}");
             return;
         }
 
-        if (!await _transport.TryReconnectAsync(cancellationToken).ConfigureAwait(false))
+        try
+        {
+            await _transport.WriteBytesAsync(new ReadOnlyMemory<byte>(buffer, 0, length), ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException or ObjectDisposedException)
+        {
+            Interlocked.Increment(ref _totalErrors);
+            Error?.Invoke(this, ex.Message);
+            return;
+        }
+
+        Interlocked.Increment(ref _totalFrames);
+        Interlocked.Add(ref _totalBytes, length);
+        Interlocked.Increment(ref _sentSinceLastRate);
+
+        var sub = FrameTransmitted;
+        if (sub is not null)
+        {
+            sub(this, new FrameTransmittedEventArgs(
+                frame,
+                frame.ToDisplayString(s.Format, s.AppendChecksum),
+                BmsCanFrameFactory.Describe(frame, _simulationSettings),
+                DateTimeOffset.Now));
+        }
+    }
+
+    private async Task TryReconnectAsync(CancellationToken ct)
+    {
+        if (_transport.CurrentOptions is null) return;
+
+        if (!await _transport.TryReconnectAsync(ct).ConfigureAwait(false))
         {
             Error?.Invoke(this, $"Reconnect failed for {_transport.CurrentOptions.PortName}. Will retry.");
         }
     }
 
-    private async Task DrainQueueAsync(CancellationToken cancellationToken)
+    /// <summary>Immutable per-loop snapshot of all mutable transmission settings.</summary>
+    private sealed record RuntimeSettings(
+        TimeSpan PackInterval,
+        TimeSpan TempInterval,
+        TimeSpan CellInterval,
+        TimeSpan BalancingInterval,
+        TimeSpan DiagnosticInterval,
+        TimeSpan HeartbeatInterval,
+        bool AppendChecksum,
+        WireFormat Format)
     {
-        while (_queue.TryDequeue(out var frame))
-        {
-            if (!_transport.IsOpen)
-            {
-                _queue.Enqueue(frame);
-                return;
-            }
+        public static RuntimeSettings From(TransmissionIntervals i, bool checksum, WireFormat format) =>
+            new(
+                Ms(i.PackStatusMs),
+                Ms(i.TemperatureMs),
+                Ms(i.CellVoltageMs),
+                Ms(i.BalancingMs),
+                Ms(i.DiagnosticMs),
+                Ms(i.HeartbeatMs),
+                checksum,
+                format);
 
-            bool includeChecksum;
-            WireFormat format;
-            lock (_settingsGate)
+        public RuntimeSettings WithIntervals(TransmissionIntervals i) =>
+            this with
             {
-                includeChecksum = _appendChecksumToWireFormat;
-                format = _wireFormat;
-            }
+                PackInterval = Ms(i.PackStatusMs),
+                TempInterval = Ms(i.TemperatureMs),
+                CellInterval = Ms(i.CellVoltageMs),
+                BalancingInterval = Ms(i.BalancingMs),
+                DiagnosticInterval = Ms(i.DiagnosticMs),
+                HeartbeatInterval = Ms(i.HeartbeatMs),
+            };
 
-            try
-            {
-                var bytes = frame.Render(format, includeChecksum);
-                await _transport.WriteBytesAsync(bytes, cancellationToken).ConfigureAwait(false);
-                Interlocked.Increment(ref _sentSinceLastRate);
-                FrameTransmitted?.Invoke(
-                    this,
-                    new FrameTransmittedEventArgs(
-                        frame,
-                        frame.ToDisplayString(format, includeChecksum),
-                        BmsCanFrameFactory.Describe(frame, _simulationSettings),
-                        DateTimeOffset.Now));
-            }
-            catch (Exception ex) when (ex is IOException or InvalidOperationException or ObjectDisposedException)
-            {
-                _queue.Enqueue(frame);
-                Error?.Invoke(this, ex.Message);
-                return;
-            }
-        }
+        private static TimeSpan Ms(int v) => TimeSpan.FromMilliseconds(Math.Max(50, v));
     }
 }

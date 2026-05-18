@@ -206,6 +206,25 @@ public sealed partial class MainWindow : Window
         await ViewModel.LoadSimulationFileAsync(file.Path);
     }
 
+    private async void OnExportLogClick(object sender, RoutedEventArgs e)
+    {
+        var picker = new FileSavePicker
+        {
+            SuggestedStartLocation = PickerLocationId.DocumentsLibrary,
+            SuggestedFileName = $"can-bus-log-{DateTimeOffset.Now:yyyyMMdd-HHmmss}"
+        };
+        picker.FileTypeChoices.Add("Text", new List<string> { ".txt" });
+
+        var hwnd = WindowNative.GetWindowHandle(this);
+        InitializeWithWindow.Initialize(picker, hwnd);
+
+        var file = await picker.PickSaveFileAsync();
+        if (file is null) return;
+
+        var text = ViewModel.BuildLogExportText();
+        await Windows.Storage.FileIO.WriteTextAsync(file, text);
+    }
+
     private async Task TryAutoLoadFileAsync()
     {
         if (_autoLoadAttempted)
