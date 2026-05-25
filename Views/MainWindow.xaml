@@ -7,7 +7,6 @@
     xmlns:vm="using:CanBusSimulator.ViewModels"
     xmlns:models="using:CanBusSimulator.Models"
     xmlns:sim="using:CanBusSimulator.Simulation"
-    xmlns:serial="using:CanBusSimulator.Serial"
     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     mc:Ignorable="d"
@@ -51,7 +50,7 @@
                            Opacity="0.4"
                            FontSize="12"
                            VerticalAlignment="Center" />
-                <TextBlock Text="ESP Master → UART → BMS Monitor"
+                <TextBlock Text="ESP Master → UART (JSON) → BMS Monitor"
                            FontSize="11"
                            Opacity="0.65"
                            VerticalAlignment="Center" />
@@ -202,7 +201,7 @@
                     </StackPanel>
                 </Border>
 
-            <!-- ============= Simulation Parameters & Wire Format ============= -->
+            <!-- ============= Simulation Parameters ============= -->
             <Border Grid.Row="1"
                     CornerRadius="8"
                     BorderThickness="1"
@@ -210,17 +209,18 @@
                     Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                     Padding="14">
                     <StackPanel Spacing="10">
-                        <TextBlock Text="Simulation Parameters &amp; Wire Format"
+                        <TextBlock Text="Simulation Parameters"
                                    FontWeight="SemiBold"
                                    FontSize="14" />
 
-                        <!-- 4 equal columns; each cell is label-above-input -->
+                        <!-- 5 equal columns; each cell is label-above-input -->
                         <Grid ColumnSpacing="12" RowSpacing="10">
                             <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" MinWidth="130" />
-                                <ColumnDefinition Width="*" MinWidth="130" />
-                                <ColumnDefinition Width="*" MinWidth="130" />
-                                <ColumnDefinition Width="*" MinWidth="130" />
+                                <ColumnDefinition Width="*" MinWidth="120" />
+                                <ColumnDefinition Width="*" MinWidth="120" />
+                                <ColumnDefinition Width="*" MinWidth="120" />
+                                <ColumnDefinition Width="*" MinWidth="120" />
+                                <ColumnDefinition Width="*" MinWidth="120" />
                             </Grid.ColumnDefinitions>
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="Auto" />
@@ -246,24 +246,6 @@
                                 <ComboBox ItemsSource="{x:Bind ViewModel.Scenarios}"
                                           SelectedItem="{x:Bind ViewModel.SelectedScenario, Mode=TwoWay}"
                                           HorizontalAlignment="Stretch" />
-                            </StackPanel>
-
-                            <StackPanel Grid.Row="0" Grid.Column="2" Spacing="4">
-                                <TextBlock Text="Wire format"
-                                           FontSize="12"
-                                           Opacity="0.7" />
-                                <ComboBox ItemsSource="{x:Bind ViewModel.WireFormats}"
-                                          SelectedItem="{x:Bind ViewModel.SelectedWireFormat, Mode=TwoWay}"
-                                          HorizontalAlignment="Stretch" />
-                            </StackPanel>
-
-                            <StackPanel Grid.Row="0" Grid.Column="3"
-                                        Spacing="4"
-                                        VerticalAlignment="Bottom">
-                                <TextBlock Text=" "
-                                           FontSize="12" />
-                                <CheckBox Content="Append checksum"
-                                          IsChecked="{x:Bind ViewModel.AppendChecksum, Mode=TwoWay}" />
                             </StackPanel>
 
                             <!-- Row 1 -->
@@ -429,7 +411,7 @@
                     </StackPanel>
                 </Border>
 
-            <!-- ============= Per-frame intervals ============= -->
+            <!-- ============= JSON send interval ============= -->
             <Border Grid.Row="3"
                     CornerRadius="8"
                     BorderThickness="1"
@@ -437,61 +419,21 @@
                     Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                     Padding="14">
                     <StackPanel Spacing="10">
-                        <TextBlock Text="Per-frame Transmission Periods (ms)"
+                        <TextBlock Text="JSON Snapshot Interval (ms)"
                                    FontWeight="SemiBold"
                                    FontSize="14" />
-                        <TextBlock Text="ESP master cadence — each CAN ID group has its own period."
+                        <TextBlock Text="Periode pengiriman satu baris JSON snapshot ke BMS Monitor."
                                    Opacity="0.65"
                                    FontSize="12" />
 
-                        <Grid ColumnSpacing="10" RowSpacing="6">
+                        <Grid ColumnSpacing="10">
                             <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" MinWidth="100" />
-                                <ColumnDefinition Width="*" MinWidth="100" />
-                                <ColumnDefinition Width="*" MinWidth="100" />
-                                <ColumnDefinition Width="*" MinWidth="100" />
-                                <ColumnDefinition Width="*" MinWidth="100" />
-                                <ColumnDefinition Width="*" MinWidth="100" />
+                                <ColumnDefinition Width="*" MinWidth="160" />
+                                <ColumnDefinition Width="*" />
                             </Grid.ColumnDefinitions>
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="Auto" />
-                            </Grid.RowDefinitions>
 
-                            <TextBlock Grid.Row="0" Grid.Column="0" Text="0x100 Pack" FontSize="12" Opacity="0.7"/>
-                            <TextBlock Grid.Row="0" Grid.Column="1" Text="0x101-105 Cells" FontSize="12" Opacity="0.7"/>
-                            <TextBlock Grid.Row="0" Grid.Column="2" Text="0x110-112 Temps" FontSize="12" Opacity="0.7"/>
-                            <TextBlock Grid.Row="0" Grid.Column="3" Text="0x120 Balance" FontSize="12" Opacity="0.7"/>
-                            <TextBlock Grid.Row="0" Grid.Column="4" Text="0x130 Diag" FontSize="12" Opacity="0.7"/>
-                            <TextBlock Grid.Row="0" Grid.Column="5" Text="0x140 Heartbeat" FontSize="12" Opacity="0.7"/>
-
-                            <NumberBox Grid.Row="1" Grid.Column="0"
-                                       Value="{x:Bind ViewModel.PackStatusMs, Mode=TwoWay}"
-                                       Minimum="50" Maximum="60000"
-                                       SpinButtonPlacementMode="Compact" SmallChange="50"
-                                       HorizontalAlignment="Stretch" />
-                            <NumberBox Grid.Row="1" Grid.Column="1"
-                                       Value="{x:Bind ViewModel.CellVoltageMs, Mode=TwoWay}"
-                                       Minimum="50" Maximum="60000"
-                                       SpinButtonPlacementMode="Compact" SmallChange="50"
-                                       HorizontalAlignment="Stretch" />
-                            <NumberBox Grid.Row="1" Grid.Column="2"
-                                       Value="{x:Bind ViewModel.TemperatureMs, Mode=TwoWay}"
-                                       Minimum="50" Maximum="60000"
-                                       SpinButtonPlacementMode="Compact" SmallChange="50"
-                                       HorizontalAlignment="Stretch" />
-                            <NumberBox Grid.Row="1" Grid.Column="3"
-                                       Value="{x:Bind ViewModel.BalancingMs, Mode=TwoWay}"
-                                       Minimum="50" Maximum="60000"
-                                       SpinButtonPlacementMode="Compact" SmallChange="50"
-                                       HorizontalAlignment="Stretch" />
-                            <NumberBox Grid.Row="1" Grid.Column="4"
-                                       Value="{x:Bind ViewModel.DiagnosticMs, Mode=TwoWay}"
-                                       Minimum="50" Maximum="60000"
-                                       SpinButtonPlacementMode="Compact" SmallChange="50"
-                                       HorizontalAlignment="Stretch" />
-                            <NumberBox Grid.Row="1" Grid.Column="5"
-                                       Value="{x:Bind ViewModel.HeartbeatMs, Mode=TwoWay}"
+                            <NumberBox Grid.Column="0"
+                                       Value="{x:Bind ViewModel.SendIntervalMs, Mode=TwoWay}"
                                        Minimum="50" Maximum="60000"
                                        SpinButtonPlacementMode="Compact" SmallChange="50"
                                        HorizontalAlignment="Stretch" />
@@ -561,14 +503,12 @@
                                     <Grid ColumnSpacing="10">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="90" />
-                                            <ColumnDefinition Width="360" />
-                                            <ColumnDefinition Width="60" />
-                                            <ColumnDefinition Width="*" MinWidth="200" />
+                                            <ColumnDefinition Width="320" />
+                                            <ColumnDefinition Width="*" MinWidth="240" />
                                         </Grid.ColumnDefinitions>
                                         <TextBlock Grid.Column="0" Text="{x:Bind Time}" Opacity="0.7" />
-                                        <TextBlock Grid.Column="1" Text="{x:Bind WireLine}" TextWrapping="NoWrap" />
-                                        <TextBlock Grid.Column="2" Text="{x:Bind Checksum}" Opacity="0.7" />
-                                        <TextBlock Grid.Column="3" Text="{x:Bind Decoded}" TextWrapping="NoWrap" />
+                                        <TextBlock Grid.Column="1" Text="{x:Bind Decoded}" TextWrapping="NoWrap" />
+                                        <TextBlock Grid.Column="2" Text="{x:Bind WireLine}" TextWrapping="NoWrap" Opacity="0.85" />
                                     </Grid>
                                 </DataTemplate>
                             </ListView.ItemTemplate>

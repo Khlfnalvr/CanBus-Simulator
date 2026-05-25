@@ -4,8 +4,8 @@ using System.Text;
 namespace CanBusSimulator.Serial;
 
 /// <summary>
-/// Serial transport built on System.IO.Ports.SerialPort.
-/// Mirrors the behavior expected by the ESP master forwarding CAN frames over UART.
+/// Serial transport built on System.IO.Ports.SerialPort. Writes raw UART bytes
+/// (the BMS Monitor text protocol) — no extra handshake.
 /// </summary>
 public sealed class SerialPortTransport : ISerialTransport
 {

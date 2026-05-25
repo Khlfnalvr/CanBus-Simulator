@@ -2,7 +2,6 @@ using System.Collections.ObjectModel;
 using System.Globalization;
 using System.Text;
 using CanBusSimulator.Configuration;
-using CanBusSimulator.Models;
 using CanBusSimulator.Serial;
 using CanBusSimulator.Simulation;
 using CanBusSimulator.Transmission;
@@ -67,12 +66,6 @@ public sealed partial class MainViewModel : ObservableObject
     private OperatingScenario _selectedScenario = OperatingScenario.Discharging;
 
     [ObservableProperty]
-    private bool _appendChecksum;
-
-    [ObservableProperty]
-    private WireFormat _selectedWireFormat = WireFormat.Custom;
-
-    [ObservableProperty]
     private double _packVoltage = 80.0;
 
     [ObservableProperty]
@@ -94,22 +87,7 @@ public sealed partial class MainViewModel : ObservableObject
     private double _balanceMask;
 
     [ObservableProperty]
-    private int _packStatusMs = 100;
-
-    [ObservableProperty]
-    private int _cellVoltageMs = 200;
-
-    [ObservableProperty]
-    private int _temperatureMs = 500;
-
-    [ObservableProperty]
-    private int _balancingMs = 1000;
-
-    [ObservableProperty]
-    private int _diagnosticMs = 500;
-
-    [ObservableProperty]
-    private int _heartbeatMs = 250;
+    private int _sendIntervalMs = 200;
 
     [ObservableProperty]
     private string _simulationFilePath = string.Empty;
@@ -134,9 +112,6 @@ public sealed partial class MainViewModel : ObservableObject
 
     public IReadOnlyList<OperatingScenario> Scenarios { get; } =
         new[] { OperatingScenario.Idle, OperatingScenario.Charging, OperatingScenario.Discharging };
-
-    public IReadOnlyList<WireFormat> WireFormats { get; } =
-        new[] { WireFormat.Custom, WireFormat.Slcan, WireFormat.Binary };
 
     public MainViewModel(
         ConfigService configService,
@@ -216,6 +191,7 @@ public sealed partial class MainViewModel : ObservableObject
         {
             _config.Serial.PortName = portName;
             _config.Serial.BaudRate = baudRate;
+
             await _transport.OpenAsync(new SerialOptions(portName, baudRate), CancellationToken.None);
             UpdateConnectionState();
         }
@@ -252,8 +228,6 @@ public sealed partial class MainViewModel : ObservableObject
 
         ApplyIntervals();
         PushUiToSimulator();
-        _transmissionService.SetWireFormat(SelectedWireFormat);
-        _transmissionService.SetAppendChecksumToWireFormat(AppendChecksum);
         _transmissionService.Start();
         IsTransmitting = true;
         StartButtonText = "Stop TX";
@@ -284,15 +258,14 @@ public sealed partial class MainViewModel : ObservableObject
     {
         // Snapshot — Log is updated only on the UI thread.
         var entries = Log.ToArray();
-        var sb = new StringBuilder(entries.Length * 96);
-        sb.AppendLine("Time         | Wire Line                                   | CHK  | Decoded");
-        sb.AppendLine("-------------+---------------------------------------------+------+-----------------------------");
+        var sb = new StringBuilder(entries.Length * 256);
+        sb.AppendLine("Time         | Decoded                                          | JSON");
+        sb.AppendLine("-------------+--------------------------------------------------+-----");
         foreach (var e in entries)
         {
             sb.Append(e.Time.PadRight(12)).Append(" | ")
-              .Append(e.WireLine.Length > 43 ? e.WireLine[..43] : e.WireLine.PadRight(43)).Append(" | ")
-              .Append(e.Checksum.PadRight(4)).Append(" | ")
-              .AppendLine(e.Decoded);
+              .Append(e.Decoded.Length > 50 ? e.Decoded[..50] : e.Decoded.PadRight(50)).Append(" | ")
+              .AppendLine(e.WireLine);
         }
         return sb.ToString();
     }
@@ -327,8 +300,6 @@ public sealed partial class MainViewModel : ObservableObject
             _config.Serial.BaudRate = baud;
         }
 
-        _config.Serial.AppendChecksumToWireFormat = AppendChecksum;
-        _config.Serial.WireFormat = SelectedWireFormat;
         _config.SimulationFile.LastFilePath = SimulationFilePath;
         _config.SimulationFile.UseFileData = UseFileData;
         _config.SimulationFile.LoopFile = LoopFile;
@@ -340,12 +311,7 @@ public sealed partial class MainViewModel : ObservableObject
         _config.Simulation.DefaultMaxTemperatureC = (byte)Math.Clamp((int)Math.Round(MaxTemp), 0, 80);
         _config.Simulation.DefaultMinTemperatureC = (byte)Math.Clamp((int)Math.Round(MinTemp), 0, 80);
         _config.Simulation.DefaultCellVoltageVolts = CellVoltage;
-        _config.Intervals.PackStatusMs = PackStatusMs;
-        _config.Intervals.TemperatureMs = TemperatureMs;
-        _config.Intervals.CellVoltageMs = CellVoltageMs;
-        _config.Intervals.BalancingMs = BalancingMs;
-        _config.Intervals.DiagnosticMs = DiagnosticMs;
-        _config.Intervals.HeartbeatMs = HeartbeatMs;
+        _config.Intervals.SendIntervalMs = SendIntervalMs;
         var error = _configService.Save(_config);
         if (error is not null)
         {
@@ -390,18 +356,6 @@ public sealed partial class MainViewModel : ObservableObject
     partial void OnCellVoltageChanged(double value) => PushUiToSimulator();
     partial void OnBalanceMaskChanged(double value) => PushUiToSimulator();
 
-    partial void OnSelectedWireFormatChanged(WireFormat value)
-    {
-        _transmissionService.SetWireFormat(value);
-        _config.Serial.WireFormat = value;
-    }
-
-    partial void OnAppendChecksumChanged(bool value)
-    {
-        _transmissionService.SetAppendChecksumToWireFormat(value);
-        _config.Serial.AppendChecksumToWireFormat = value;
-    }
-
     partial void OnUseFileDataChanged(bool value)
     {
         _snapshotProvider.UseFileSource = value;
@@ -421,18 +375,11 @@ public sealed partial class MainViewModel : ObservableObject
         _config.SimulationFile.ReplayRowIntervalMs = value;
     }
 
-    partial void OnPackStatusMsChanged(int value) => ApplyIntervals();
-    partial void OnCellVoltageMsChanged(int value) => ApplyIntervals();
-    partial void OnTemperatureMsChanged(int value) => ApplyIntervals();
-    partial void OnBalancingMsChanged(int value) => ApplyIntervals();
-    partial void OnDiagnosticMsChanged(int value) => ApplyIntervals();
-    partial void OnHeartbeatMsChanged(int value) => ApplyIntervals();
+    partial void OnSendIntervalMsChanged(int value) => ApplyIntervals();
 
     private void LoadFromConfig()
     {
         BaudRateText = _config.Serial.BaudRate.ToString(CultureInfo.InvariantCulture);
-        AppendChecksum = _config.Serial.AppendChecksumToWireFormat;
-        SelectedWireFormat = _config.Serial.WireFormat;
         SelectedScenario = _config.Simulation.InitialScenario;
         PackVoltage = _config.Simulation.DefaultPackVoltageVolts;
         PackCurrent = _config.Simulation.DefaultCurrentAmps;
@@ -440,12 +387,7 @@ public sealed partial class MainViewModel : ObservableObject
         MaxTemp = _config.Simulation.DefaultMaxTemperatureC;
         MinTemp = _config.Simulation.DefaultMinTemperatureC;
         CellVoltage = _config.Simulation.DefaultCellVoltageVolts;
-        PackStatusMs = _config.Intervals.PackStatusMs;
-        TemperatureMs = _config.Intervals.TemperatureMs;
-        CellVoltageMs = _config.Intervals.CellVoltageMs;
-        BalancingMs = _config.Intervals.BalancingMs;
-        DiagnosticMs = _config.Intervals.DiagnosticMs;
-        HeartbeatMs = _config.Intervals.HeartbeatMs;
+        SendIntervalMs = _config.Intervals.SendIntervalMs;
         SimulationFilePath = _config.SimulationFile.LastFilePath;
         UseFileData = _config.SimulationFile.UseFileData;
         LoopFile = _config.SimulationFile.LoopFile;
@@ -489,12 +431,7 @@ public sealed partial class MainViewModel : ObservableObject
 
     private void ApplyIntervals()
     {
-        _config.Intervals.PackStatusMs = PackStatusMs;
-        _config.Intervals.TemperatureMs = TemperatureMs;
-        _config.Intervals.CellVoltageMs = CellVoltageMs;
-        _config.Intervals.BalancingMs = BalancingMs;
-        _config.Intervals.DiagnosticMs = DiagnosticMs;
-        _config.Intervals.HeartbeatMs = HeartbeatMs;
+        _config.Intervals.SendIntervalMs = SendIntervalMs;
         _transmissionService.UpdateIntervals(_config.Intervals);
     }
 
@@ -533,7 +470,6 @@ public sealed partial class MainViewModel : ObservableObject
         var entry = new LogEntry(
             args.Timestamp.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture),
             args.WireLine,
-            $"0x{args.Checksum:X2}",
             args.DecodedText);
 
         Log.Insert(0, entry);

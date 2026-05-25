@@ -36,10 +36,7 @@ public partial class App : Application
         var transmissionService = new TransmissionService(
             transport,
             provider,
-            config.Simulation,
-            config.Intervals,
-            config.Serial.AppendChecksumToWireFormat,
-            config.Serial.WireFormat);
+            config.Intervals);
 
         var viewModel = new MainViewModel(
             configService,

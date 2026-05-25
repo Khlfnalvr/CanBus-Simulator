@@ -1,3 +1,4 @@
+using System.IO;
 using CanBusSimulator.ViewModels;
 using Microsoft.UI;
 using Microsoft.UI.Xaml;
@@ -55,6 +56,10 @@ public sealed partial class MainWindow : Window
         var windowId = Win32Interop.GetWindowIdFromWindow(hwnd);
         var appWindow = AppWindow.GetFromWindowId(windowId);
         appWindow.Resize(new Windows.Graphics.SizeInt32(1100, 820));
+
+        var iconPath = Path.Combine(AppContext.BaseDirectory, "app.ico");
+        if (File.Exists(iconPath))
+            appWindow.SetIcon(iconPath);
 
         // Mica backdrop — automatically follows the system light/dark theme on Windows 11.
         try

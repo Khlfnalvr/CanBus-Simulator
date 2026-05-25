@@ -1,4 +1,3 @@
-using CanBusSimulator.Models;
 using CanBusSimulator.Simulation;
 using CanBusSimulator.Transmission;
 
@@ -15,7 +14,7 @@ public sealed class AppConfig
     /// <summary>Serial connection settings used by the COM writer.</summary>
     public SerialConfig Serial { get; set; } = new();
 
-    /// <summary>Periodic message intervals for each BMS CAN identifier group.</summary>
+    /// <summary>JSON-snapshot transmission cadence.</summary>
     public TransmissionIntervals Intervals { get; set; } = new();
 
     /// <summary>Runtime defaults and scaling factors for generated BMS data.</summary>
@@ -35,17 +34,6 @@ public sealed class SerialConfig
 
     /// <summary>UART baud rate. The default matches the ESP32 firmware note.</summary>
     public int BaudRate { get; set; } = 115200;
-
-    /// <summary>
-    /// Appends an XOR checksum field to the wire output.
-    /// For Custom format: <c>,CHK:HH</c> token.
-    /// For Binary format: trailing XOR byte.
-    /// Ignored for SLCAN (terminator only).
-    /// </summary>
-    public bool AppendChecksumToWireFormat { get; set; }
-
-    /// <summary>Wire format used for outgoing frames.</summary>
-    public WireFormat WireFormat { get; set; } = WireFormat.Custom;
 }
 
 /// <summary>
